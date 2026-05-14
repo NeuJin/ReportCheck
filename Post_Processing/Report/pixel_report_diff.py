@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Compare report files by rendered pixels and/or PowerPoint objects.
 
 Python version: 3.9+
@@ -30,7 +30,7 @@ PPT_EXTS = {".ppt", ".pptx"}
 PPTX_EXT = ".pptx"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 EMU_PER_POINT = 12700
-DEFAULT_OUTPUT_DIR = "C:/Users/TechnoStar/Python/Conrod/Post_Processing/Report"
+DEFAULT_OUTPUT_DIR = "output"
 
 
 @dataclass
@@ -343,6 +343,29 @@ def compare_objects(args: argparse.Namespace, output_dir: Path) -> List[ObjectDi
     return diffs
 
 
+def get_package_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def resolve_output_dir(output_dir: str) -> Path:
+    package_root = get_package_root()
+    requested = Path(output_dir)
+    if not requested.is_absolute():
+        requested = package_root / requested
+
+    resolved = requested.resolve()
+    try:
+        resolved.relative_to(package_root)
+    except ValueError:
+        raise ValueError(
+            "Output directory must stay inside the tool package folder: {}".format(
+                package_root
+            )
+        )
+
+    return resolved
+
+
 def validate_inputs(args: argparse.Namespace) -> None:
     expected_path = Path(args.expected)
     actual_path = Path(args.actual)
@@ -472,7 +495,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         validate_inputs(args)
-        output_dir = Path(args.output_dir)
+        output_dir = resolve_output_dir(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         pixel_results = []
@@ -496,3 +519,5 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

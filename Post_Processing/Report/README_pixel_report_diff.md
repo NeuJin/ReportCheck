@@ -1,19 +1,16 @@
-# Pixel Report Diff Tool
+﻿# Pixel Report Diff Tool
 
 Compare two reports by rendered pixels and/or PowerPoint objects.
 
 Recommended for PPTX report checking:
 
 ```powershell
-python pixel_report_diff.py expected.pptx actual.pptx -o diff_output --mode both --threshold 3
+python pixel_report_diff.py expected.pptx actual.pptx --mode both --threshold 3
 ```
 
 This creates slide screenshots, pixel-diff highlight images, and an object-level JSON diff.
-If `-o` is not provided, output is saved to:
-
-```text
-C:/Users/TechnoStar/Python/Conrod/Post_Processing/Report
-```
+If `-o` is not provided, output is saved to an `output` folder next to `pixel_report_diff.py`.
+The tool intentionally refuses to write output outside the downloaded package folder.
 
 ## Install
 
@@ -32,32 +29,32 @@ Dependencies by input type, matched to your current environment:
 ## Usage
 
 ```powershell
-python pixel_report_diff.py expected.png actual.png -o diff_output --mode pixel
+python pixel_report_diff.py expected.png actual.png -o output --mode pixel
 ```
 
 For PPT/PPTX slide screenshot comparison:
 
 ```powershell
-python pixel_report_diff.py expected.pptx actual.pptx -o diff_output --mode pixel --dpi 150
+python pixel_report_diff.py expected.pptx actual.pptx -o output --mode pixel --dpi 150
 ```
 
 For PPTX object comparison:
 
 ```powershell
-python pixel_report_diff.py expected.pptx actual.pptx -o diff_output --mode object
+python pixel_report_diff.py expected.pptx actual.pptx -o output --mode object
 ```
 
 For best practical accuracy, combine both:
 
 ```powershell
-python pixel_report_diff.py expected.pptx actual.pptx -o diff_output --mode both --threshold 3
+python pixel_report_diff.py expected.pptx actual.pptx --mode both --threshold 3
 ```
 
 Useful options:
 
 ```powershell
 python pixel_report_diff.py expected.png actual.png `
-  -o diff_output `
+  -o output `
   --threshold 5 `
   --allowed-percent 0.01 `
   --highlight-color 255,0,0 `
@@ -84,3 +81,5 @@ Pixel comparison catches the final visual result, including charts, images, font
 Object comparison catches changes in PPTX shape order, position, size, text, and embedded image content without relying on screenshot rendering. It is useful for precise automation, but it may not fully understand complex charts, SmartArt, grouped objects, or effects.
 
 Use `--mode both` when the report quality gate matters: pixel diff verifies the visual output, and object diff explains many structural changes.
+
+
