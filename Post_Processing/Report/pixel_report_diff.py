@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Compare report files by rendered pixels and/or PowerPoint objects.
+
+Python version: 3.9+
+
+Supported pixel inputs:
+- Images supported by Pillow: PNG, JPG, JPEG, BMP, TIFF, WEBP.
+- PPT/PPTX files on Windows when Microsoft PowerPoint + pywin32 are installed.
+
+Supported object inputs:
+- PPTX files when python-pptx is installed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from PIL import Image, ImageChops
+
+
+PPT_EXTS = {".ppt", ".pptx"}
+PPTX_EXT = ".pptx"
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+EMU_PER_POINT = 12700
+DEFAULT_OUTPUT_DIR = "C:/Users/TechnoStar/Python/Conrod/Post_Processing/Report"
+
+
+@dataclass
+class PageDiff:
+    page: int
+    width: int
+    height: int
+    compared_pixels: int
+    different_pixels: int
+    difference_percent: float
+    max_channel_delta: int
+    bbox: Optional[Tuple[int, int, int, int]]
+    passed: bool
+    output_overlay: str
+    output_mask: str
+
+
+@dataclass
+class ObjectDiff:
+    slide: int
+    object_index: int
+    field: str
+    expected: Any
+    actual: Any
+
+
+def parse_color(value: str) -> Tuple[int, int, int]:
+    parts = value.split(",")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("Color must be formatted as R,G,B")
+
+    try:
+        rgb = tuple(int(part.strip()) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Color values must be integers") from exc
+
+    if any(channel < 0 or channel > 255 for channel in rgb):
+        raise argparse.ArgumentTypeError("Color values must be between 0 and 255")
+
+    return rgb  # type: ignore[return-value]
+
+
+def safe_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def export_ppt_to_png(path: Path, dpi: int, temp_root: Path) -> List[Path]:
+    try:
+        import win32com.client  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "PPT/PPTX pixel comparison requires pywin32. Install it with: pip install pywin32"
+        ) from exc
+
+    export_dir = temp_root / path.stem
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    powerpoint = win32com.client.DispatchEx("PowerPoint.Application")
+    presentation = None
+    try:
+        presentation = powerpoint.Presentations.Open(
+            str(path.resolve()),
+            WithWindow=False,
+            ReadOnly=True,
+        )
+        width = int(round((presentation.PageSetup.SlideWidth / 72.0) * dpi))
+        height = int(round((presentation.PageSetup.SlideHeight / 72.0) * dpi))
+        presentation.Export(str(export_dir), "PNG", width, height)
+    finally:
+        if presentation is not None:
+            presentation.Close()
+        powerpoint.Quit()
+
+    exported = sorted(export_dir.glob("*.PNG"), key=slide_export_sort_key)
+    if not exported:
+        exported = sorted(export_dir.glob("*.png"), key=slide_export_sort_key)
+    if not exported:
+        raise RuntimeError("PowerPoint did not export any slide images.")
+    return exported
+
+
+def slide_export_sort_key(path: Path) -> Tuple[int, str]:
+    digits = "".join(character for character in path.stem if character.isdigit())
+    number = int(digits) if digits else 0
+    return number, path.name.lower()
+
+
+def load_ppt_pages(path: Path, dpi: int, temp_root: Path) -> List[Image.Image]:
+    image_paths = export_ppt_to_png(path, dpi, temp_root)
+    pages = []
+    for image_path in image_paths:
+        with Image.open(image_path) as image:
+            pages.append(image.convert("RGB"))
+    return pages
+
+
+def load_pages(path: Path, dpi: int, temp_root: Path) -> List[Image.Image]:
+    suffix = path.suffix.lower()
+    if suffix in PPT_EXTS:
+        return load_ppt_pages(path, dpi, temp_root)
+    if suffix not in IMAGE_EXTS:
+        raise ValueError(
+            "Unsupported input type '{}'. Use an image, PPT, or PPTX file.".format(
+                path.suffix
+            )
+        )
+
+    with Image.open(path) as image:
+        return [image.convert("RGB")]
+
+
+def fit_to_same_canvas(
+    expected: Image.Image,
+    actual: Image.Image,
+    background: Tuple[int, int, int] = (255, 255, 255),
+) -> Tuple[Image.Image, Image.Image]:
+    width = max(expected.width, actual.width)
+    height = max(expected.height, actual.height)
+
+    expected_canvas = Image.new("RGB", (width, height), background)
+    actual_canvas = Image.new("RGB", (width, height), background)
+    expected_canvas.paste(expected.convert("RGB"), (0, 0))
+    actual_canvas.paste(actual.convert("RGB"), (0, 0))
+
+    return expected_canvas, actual_canvas
+
+
+def build_threshold_mask(diff: Image.Image, threshold: int) -> Image.Image:
+    channel_masks = [
+        channel.point(lambda value: 255 if value > threshold else 0)
+        for channel in diff.convert("RGB").split()
+    ]
+    return ImageChops.lighter(ImageChops.lighter(channel_masks[0], channel_masks[1]), channel_masks[2])
+
+
+def count_mask_pixels(mask: Image.Image) -> int:
+    histogram = mask.histogram()
+    return sum(count for value, count in enumerate(histogram) if value > 0)
+
+
+def make_overlay(
+    base: Image.Image,
+    mask: Image.Image,
+    highlight_color: Tuple[int, int, int],
+    alpha: int,
+) -> Image.Image:
+    highlight = Image.new("RGB", base.size, highlight_color)
+    alpha_mask = mask.point(lambda value: alpha if value else 0)
+    return Image.composite(highlight, base.convert("RGB"), alpha_mask)
+
+
+def compare_page(
+    expected: Image.Image,
+    actual: Image.Image,
+    page_number: int,
+    output_dir: Path,
+    threshold: int,
+    allowed_percent: float,
+    highlight_color: Tuple[int, int, int],
+    alpha: int,
+) -> PageDiff:
+    expected_canvas, actual_canvas = fit_to_same_canvas(expected, actual)
+    diff = ImageChops.difference(expected_canvas, actual_canvas)
+    mask = build_threshold_mask(diff, threshold)
+
+    different_pixels = count_mask_pixels(mask)
+    compared_pixels = mask.width * mask.height
+    difference_percent = (different_pixels / compared_pixels) * 100 if compared_pixels else 0
+    extrema = diff.getextrema()
+    max_channel_delta = max(channel_max for _channel_min, channel_max in extrema)
+    bbox = mask.getbbox()
+    passed = difference_percent <= allowed_percent
+
+    overlay = make_overlay(actual_canvas, mask, highlight_color, alpha)
+    overlay_path = output_dir / "page_{:03d}_overlay.png".format(page_number)
+    mask_path = output_dir / "page_{:03d}_mask.png".format(page_number)
+    overlay.save(overlay_path)
+    mask.save(mask_path)
+
+    return PageDiff(
+        page=page_number,
+        width=mask.width,
+        height=mask.height,
+        compared_pixels=compared_pixels,
+        different_pixels=different_pixels,
+        difference_percent=round(difference_percent, 6),
+        max_channel_delta=max_channel_delta,
+        bbox=bbox,
+        passed=passed,
+        output_overlay=str(overlay_path),
+        output_mask=str(mask_path),
+    )
+
+
+def compare_pixels(args: argparse.Namespace, output_dir: Path) -> List[PageDiff]:
+    temp_root = Path(tempfile.mkdtemp(prefix="report_diff_render_"))
+    try:
+        expected_pages = load_pages(Path(args.expected), args.dpi, temp_root / "expected")
+        actual_pages = load_pages(Path(args.actual), args.dpi, temp_root / "actual")
+    finally:
+        shutil.rmtree(str(temp_root), ignore_errors=True)
+
+    page_count = max(len(expected_pages), len(actual_pages))
+    results = []
+    blank = Image.new("RGB", (1, 1), (255, 255, 255))
+
+    for index in range(page_count):
+        expected = expected_pages[index] if index < len(expected_pages) else blank
+        actual = actual_pages[index] if index < len(actual_pages) else blank
+        results.append(
+            compare_page(
+                expected=expected,
+                actual=actual,
+                page_number=index + 1,
+                output_dir=output_dir,
+                threshold=args.threshold,
+                allowed_percent=args.allowed_percent,
+                highlight_color=args.highlight_color,
+                alpha=args.alpha,
+            )
+        )
+
+    return results
+
+
+def hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def emu_to_points(value: int) -> float:
+    return round(float(value) / EMU_PER_POINT, 3)
+
+
+def shape_to_record(shape: Any) -> Dict[str, Any]:
+    record = {
+        "name": safe_text(getattr(shape, "name", "")),
+        "shape_type": safe_text(getattr(shape, "shape_type", "")),
+        "left_pt": emu_to_points(getattr(shape, "left", 0)),
+        "top_pt": emu_to_points(getattr(shape, "top", 0)),
+        "width_pt": emu_to_points(getattr(shape, "width", 0)),
+        "height_pt": emu_to_points(getattr(shape, "height", 0)),
+        "text": "",
+        "image_sha256": "",
+    }
+
+    if getattr(shape, "has_text_frame", False):
+        record["text"] = safe_text(shape.text_frame.text)
+
+    if hasattr(shape, "image"):
+        try:
+            record["image_sha256"] = hash_bytes(shape.image.blob)
+        except Exception:
+            record["image_sha256"] = ""
+
+    return record
+
+
+def extract_pptx_objects(path: Path) -> List[List[Dict[str, Any]]]:
+    try:
+        from pptx import Presentation  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "PPTX object comparison requires python-pptx. Install it with: pip install python-pptx"
+        ) from exc
+
+    presentation = Presentation(str(path))
+    slides = []
+    for slide in presentation.slides:
+        slides.append([shape_to_record(shape) for shape in slide.shapes])
+    return slides
+
+
+def compare_objects(args: argparse.Namespace, output_dir: Path) -> List[ObjectDiff]:
+    expected_path = Path(args.expected)
+    actual_path = Path(args.actual)
+    if expected_path.suffix.lower() != PPTX_EXT or actual_path.suffix.lower() != PPTX_EXT:
+        raise ValueError("Object comparison currently supports .pptx files only.")
+
+    expected_slides = extract_pptx_objects(expected_path)
+    actual_slides = extract_pptx_objects(actual_path)
+    slide_count = max(len(expected_slides), len(actual_slides))
+    diffs = []
+
+    for slide_index in range(slide_count):
+        expected_shapes = expected_slides[slide_index] if slide_index < len(expected_slides) else []
+        actual_shapes = actual_slides[slide_index] if slide_index < len(actual_slides) else []
+        object_count = max(len(expected_shapes), len(actual_shapes))
+
+        for object_index in range(object_count):
+            expected = expected_shapes[object_index] if object_index < len(expected_shapes) else {}
+            actual = actual_shapes[object_index] if object_index < len(actual_shapes) else {}
+            fields = sorted(set(expected.keys()) | set(actual.keys()))
+            for field in fields:
+                if expected.get(field) != actual.get(field):
+                    diffs.append(
+                        ObjectDiff(
+                            slide=slide_index + 1,
+                            object_index=object_index + 1,
+                            field=field,
+                            expected=expected.get(field),
+                            actual=actual.get(field),
+                        )
+                    )
+
+    object_summary = output_dir / "object_summary.json"
+    object_summary.write_text(
+        json.dumps([asdict(diff) for diff in diffs], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return diffs
+
+
+def validate_inputs(args: argparse.Namespace) -> None:
+    expected_path = Path(args.expected)
+    actual_path = Path(args.actual)
+
+    if not expected_path.exists():
+        raise FileNotFoundError("Expected report not found: {}".format(expected_path))
+    if not actual_path.exists():
+        raise FileNotFoundError("Actual report not found: {}".format(actual_path))
+
+    if args.threshold < 0 or args.threshold > 255:
+        raise ValueError("--threshold must be between 0 and 255")
+    if args.allowed_percent < 0 or args.allowed_percent > 100:
+        raise ValueError("--allowed-percent must be between 0 and 100")
+    if args.alpha < 0 or args.alpha > 255:
+        raise ValueError("--alpha must be between 0 and 255")
+    if args.dpi <= 0:
+        raise ValueError("--dpi must be greater than 0")
+
+
+def write_summary(output_dir: Path, pixel_results: Sequence[PageDiff], object_diffs: Sequence[ObjectDiff]) -> None:
+    payload = {
+        "pixel_results": [asdict(result) for result in pixel_results],
+        "object_diffs": [asdict(diff) for diff in object_diffs],
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def print_summary(pixel_results: Iterable[PageDiff], object_diffs: Sequence[ObjectDiff]) -> None:
+    total_pages = 0
+    failed_pages = 0
+
+    for result in pixel_results:
+        total_pages += 1
+        if not result.passed:
+            failed_pages += 1
+
+        status = "PASS" if result.passed else "FAIL"
+        print(
+            "[{}] page={} diff={:.6f}% pixels={}/{} bbox={} overlay={}".format(
+                status,
+                result.page,
+                result.difference_percent,
+                result.different_pixels,
+                result.compared_pixels,
+                result.bbox,
+                result.output_overlay,
+            )
+        )
+
+    if total_pages:
+        print("Pages compared: {}; failed pages: {}".format(total_pages, failed_pages))
+
+    if object_diffs:
+        print("Object differences: {}".format(len(object_diffs)))
+        for diff in object_diffs[:20]:
+            print(
+                "[OBJECT] slide={} object={} field={}".format(
+                    diff.slide,
+                    diff.object_index,
+                    diff.field,
+                )
+            )
+        if len(object_diffs) > 20:
+            print("... {} more object differences in object_summary.json".format(len(object_diffs) - 20))
+    elif total_pages == 0:
+        print("Object differences: 0")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Compare report files by pixels and/or PowerPoint objects."
+    )
+    parser.add_argument("expected", help="Baseline report image/PPT/PPTX")
+    parser.add_argument("actual", help="Report image/PPT/PPTX to check")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for overlay images, masks, and JSON summaries",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("pixel", "object", "both"),
+        default="pixel",
+        help="pixel renders pages/slides; object compares PPTX shapes; both runs both checks",
+    )
+    parser.add_argument(
+        "-t",
+        "--threshold",
+        type=int,
+        default=0,
+        help="Ignore per-channel pixel differences at or below this value",
+    )
+    parser.add_argument(
+        "--allowed-percent",
+        type=float,
+        default=0.0,
+        help="Maximum allowed percent of different pixels before a page fails",
+    )
+    parser.add_argument(
+        "--highlight-color",
+        type=parse_color,
+        default=(255, 0, 0),
+        help="Overlay color as R,G,B",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=int,
+        default=180,
+        help="Highlight opacity from 0 to 255",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=150,
+        help="DPI used when rendering PowerPoint slides",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        validate_inputs(args)
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        pixel_results = []
+        object_diffs = []
+
+        if args.mode in ("pixel", "both"):
+            pixel_results = compare_pixels(args, output_dir)
+        if args.mode in ("object", "both"):
+            object_diffs = compare_objects(args, output_dir)
+
+        write_summary(output_dir, pixel_results, object_diffs)
+    except Exception as exc:
+        print("Error: {}".format(exc), file=sys.stderr)
+        return 2
+
+    print_summary(pixel_results, object_diffs)
+    pixels_passed = all(result.passed for result in pixel_results)
+    objects_passed = len(object_diffs) == 0
+    return 0 if pixels_passed and objects_passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
