@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 
 PPT_EXTS = {".ppt", ".pptx"}
@@ -46,6 +46,7 @@ class PageDiff:
     passed: bool
     output_overlay: str
     output_mask: str
+    regions: List[Tuple[int, int, int, int]]
 
 
 @dataclass
@@ -171,15 +172,75 @@ def count_mask_pixels(mask: Image.Image) -> int:
     return sum(count for value, count in enumerate(histogram) if value > 0)
 
 
+def mask_to_regions(mask: Image.Image, min_area: int = 16, padding: int = 3) -> List[Tuple[int, int, int, int]]:
+    binary = mask.convert("1")
+    width, height = binary.size
+    pixels = binary.load()
+    visited = set()
+    regions = []
+
+    for start_y in range(height):
+        for start_x in range(width):
+            point = (start_x, start_y)
+            if point in visited or not pixels[start_x, start_y]:
+                continue
+
+            stack = [point]
+            visited.add(point)
+            min_x = max_x = start_x
+            min_y = max_y = start_y
+            area = 0
+
+            while stack:
+                x, y = stack.pop()
+                area += 1
+                min_x = min(min_x, x)
+                max_x = max(max_x, x)
+                min_y = min(min_y, y)
+                max_y = max(max_y, y)
+
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                        continue
+                    neighbor = (nx, ny)
+                    if neighbor in visited or not pixels[nx, ny]:
+                        continue
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+
+            if area >= min_area:
+                regions.append(
+                    (
+                        max(0, min_x - padding),
+                        max(0, min_y - padding),
+                        min(width, max_x + 1 + padding),
+                        min(height, max_y + 1 + padding),
+                    )
+                )
+
+    return regions
+
+
 def make_overlay(
     base: Image.Image,
-    mask: Image.Image,
+    regions: Sequence[Tuple[int, int, int, int]],
     highlight_color: Tuple[int, int, int],
     alpha: int,
 ) -> Image.Image:
-    highlight = Image.new("RGB", base.size, highlight_color)
-    alpha_mask = mask.point(lambda value: alpha if value else 0)
-    return Image.composite(highlight, base.convert("RGB"), alpha_mask)
+    overlay = base.convert("RGBA")
+    highlight_layer = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(highlight_layer)
+    fill = (highlight_color[0], highlight_color[1], highlight_color[2], alpha)
+    outline = (highlight_color[0], highlight_color[1], highlight_color[2], 255)
+
+    for region in regions:
+        draw.rectangle(region, fill=fill, outline=outline)
+        for inset in range(1, 4):
+            x1, y1, x2, y2 = region
+            if x2 - x1 > inset * 2 and y2 - y1 > inset * 2:
+                draw.rectangle((x1 + inset, y1 + inset, x2 - inset, y2 - inset), outline=outline)
+
+    return Image.alpha_composite(overlay, highlight_layer).convert("RGB")
 
 
 def compare_page(
@@ -203,8 +264,9 @@ def compare_page(
     max_channel_delta = max(channel_max for _channel_min, channel_max in extrema)
     bbox = mask.getbbox()
     passed = difference_percent <= allowed_percent
+    regions = mask_to_regions(mask)
 
-    overlay = make_overlay(actual_canvas, mask, highlight_color, alpha)
+    overlay = make_overlay(actual_canvas, regions, highlight_color, alpha)
     overlay_path = output_dir / "page_{:03d}_overlay.png".format(page_number)
     mask_path = output_dir / "page_{:03d}_mask.png".format(page_number)
     overlay.save(overlay_path)
@@ -222,6 +284,7 @@ def compare_page(
         passed=passed,
         output_overlay=str(overlay_path),
         output_mask=str(mask_path),
+        regions=regions,
     )
 
 
@@ -477,8 +540,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--alpha",
         type=int,
-        default=180,
-        help="Highlight opacity from 0 to 255",
+        default=51,
+        help="Highlight fill opacity from 0 to 255; 51 is 20 percent",
     )
     parser.add_argument(
         "--dpi",
@@ -519,5 +582,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
 
 

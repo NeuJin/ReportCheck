@@ -9,6 +9,7 @@ C:\Users\TechnoStar\Python\Conrod\Post_Processing\Report\
 ├── report.py
 ├── template.py
 ├── pixel_report_diff.py
+├── report_diff_gui.py
 ├── requirements.txt
 ├── README_pixel_report_diff.md
 ├── GITHUB_PUSH_WORKFLOW.md
@@ -43,6 +44,7 @@ Stage the report tool files:
 
 ```powershell
 git add Post_Processing/Report/pixel_report_diff.py
+git add Post_Processing/Report/report_diff_gui.py
 git add Post_Processing/Report/requirements.txt
 git add Post_Processing/Report/README_pixel_report_diff.md
 git add Post_Processing/Report/GITHUB_PUSH_WORKFLOW.md
@@ -122,23 +124,31 @@ The machine also needs Microsoft PowerPoint installed because slide image export
 
 ## 4. Run Report Comparison
 
-Recommended command:
+Recommended GUI command:
+
+```powershell
+python report_diff_gui.py
+```
+
+Command-line alternative:
 
 ```powershell
 python pixel_report_diff.py expected.pptx actual.pptx --mode both --threshold 3
 ```
 
-Default output folder:
+Default output folder stays inside the downloaded package:
 
 ```text
-C:/Users/TechnoStar/Python/Conrod/Post_Processing/Report
+Post_Processing/Report/output
 ```
 
-To choose another output folder:
+To choose another output folder, use a relative folder name inside the package:
 
 ```powershell
-python pixel_report_diff.py expected.pptx actual.pptx -o diff_output --mode both --threshold 3
+python pixel_report_diff.py expected.pptx actual.pptx -o result_check --mode both --threshold 3
 ```
+
+The tool refuses output paths outside the downloaded package folder.
 
 ## 5. Read Results
 
@@ -158,3 +168,5 @@ Exit codes:
 1 = differences found
 2 = runtime/input error
 ```
+
+

@@ -12,6 +12,24 @@ This creates slide screenshots, pixel-diff highlight images, and an object-level
 If `-o` is not provided, output is saved to an `output` folder next to `pixel_report_diff.py`.
 The tool intentionally refuses to write output outside the downloaded package folder.
 
+
+## GUI Usage
+
+Run the window app from the downloaded package folder:
+
+```powershell
+python report_diff_gui.py
+```
+
+Workflow:
+
+1. Select the expected PPT/PPTX report.
+2. Select the actual PPT/PPTX report.
+3. Keep output as `output` so all generated files stay inside the downloaded package.
+4. Click `Run compare`.
+5. Use the slide list to view only different slides.
+
+The GUI highlights differences with red rectangle regions using 20% transparent fill and a strong red border. This is easier to inspect than per-pixel red noise.
 ## Install
 
 Use Python 3.9+.
@@ -25,6 +43,7 @@ Dependencies by input type, matched to your current environment:
 - Image: `Pillow 8.1.2`
 - PPT/PPTX pixel screenshot comparison: `Pillow 8.1.2`, `pywin32 224`, Microsoft PowerPoint installed
 - PPTX object comparison: `python-pptx 0.6.18`
+- GUI window: `PySide2 5.15.2`
 
 ## Usage
 
@@ -58,7 +77,7 @@ python pixel_report_diff.py expected.png actual.png `
   --threshold 5 `
   --allowed-percent 0.01 `
   --highlight-color 255,0,0 `
-  --alpha 180
+  --alpha 51
 ```
 
 Outputs:
@@ -81,5 +100,7 @@ Pixel comparison catches the final visual result, including charts, images, font
 Object comparison catches changes in PPTX shape order, position, size, text, and embedded image content without relying on screenshot rendering. It is useful for precise automation, but it may not fully understand complex charts, SmartArt, grouped objects, or effects.
 
 Use `--mode both` when the report quality gate matters: pixel diff verifies the visual output, and object diff explains many structural changes.
+
+
 
 

@@ -1,3 +1,5 @@
-Pillow==8.1.2
+﻿Pillow==8.1.2
 pywin32==224; platform_system == "Windows"
 python-pptx==0.6.18
+PySide2==5.15.2
+
