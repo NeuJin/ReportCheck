@@ -1,17 +1,12 @@
 ﻿#!/usr/bin/env python3
-"""GUI for PPT report visual comparison.
-
-Python version: 3.9+
-Requires PySide2, Pillow, pywin32, and python-pptx from the bundled environment.
-"""
+"""GUI for PPT report visual comparison."""
 
 from __future__ import annotations
 
 import sys
 import traceback
-from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Optional
 
 from PySide2.QtCore import QObject, QSize, Qt, QThread, Signal
 from PySide2.QtGui import QPixmap
@@ -19,6 +14,7 @@ from PySide2.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -28,6 +24,7 @@ from PySide2.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -42,9 +39,22 @@ from PySide2.QtWidgets import (
 import pixel_report_diff as engine
 
 
+HELP_TEXT = (
+    "Pixel threshold: ignores tiny RGB differences. 3 is recommended; "
+    "5-8 reduces render noise; 0 is strict.\n"
+    "DPI: screenshot resolution for each slide. 150 is balanced; "
+    "200 catches smaller text/chart changes but runs slower.\n"
+    "Allowed diff %: percent of different pixels allowed before a slide is marked DIFF. "
+    "0 is strict; 0.01-0.05 tolerates small render noise.\n"
+    "Highlight: red rectangles with 20% transparent fill and a strong red border. "
+    "Output always stays inside this package."
+)
+
+
 class CompareWorker(QObject):
     finished = Signal(object, object, str)
     failed = Signal(str)
+    progress = Signal(int, str)
 
     def __init__(self, args: SimpleNamespace):
         super().__init__()
@@ -52,6 +62,7 @@ class CompareWorker(QObject):
 
     def run(self) -> None:
         try:
+            self.progress.emit(5, "Validating input files...")
             engine.validate_inputs(self.args)
             output_dir = engine.resolve_output_dir(self.args.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -59,11 +70,17 @@ class CompareWorker(QObject):
             pixel_results = []
             object_diffs = []
             if self.args.mode in ("pixel", "both"):
+                self.progress.emit(20, "Rendering slides and comparing pixels...")
                 pixel_results = engine.compare_pixels(self.args, output_dir)
+                self.progress.emit(70, "Pixel comparison complete.")
             if self.args.mode in ("object", "both"):
+                self.progress.emit(75, "Comparing PPTX objects...")
                 object_diffs = engine.compare_objects(self.args, output_dir)
+                self.progress.emit(90, "Object comparison complete.")
 
+            self.progress.emit(95, "Writing summary files...")
             engine.write_summary(output_dir, pixel_results, object_diffs)
+            self.progress.emit(100, "Done.")
             self.finished.emit(pixel_results, object_diffs, str(output_dir))
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -105,7 +122,7 @@ class ReportDiffWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ReportCheck - PPT Slide Diff")
-        self.resize(1200, 760)
+        self.resize(1240, 800)
 
         self.pixel_results = []
         self.object_diffs = []
@@ -119,15 +136,24 @@ class ReportDiffWindow(QMainWindow):
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["both", "pixel", "object"])
+        self.mode_combo.setToolTip("both = visual pixel diff + PPTX object diff. Recommended.")
+
         self.threshold_spin = QSpinBox()
         self.threshold_spin.setRange(0, 255)
         self.threshold_spin.setValue(3)
+        self.threshold_spin.setToolTip("Ignore tiny per-channel color differences. 3 recommended; 5-8 for render noise; 0 strict.")
+
         self.dpi_spin = QSpinBox()
         self.dpi_spin.setRange(50, 300)
         self.dpi_spin.setValue(150)
-        self.allowed_spin = QSpinBox()
-        self.allowed_spin.setRange(0, 100)
-        self.allowed_spin.setValue(0)
+        self.dpi_spin.setToolTip("Slide screenshot resolution. 150 balanced; 200 better for small text/charts but slower.")
+
+        self.allowed_spin = QDoubleSpinBox()
+        self.allowed_spin.setRange(0.0, 100.0)
+        self.allowed_spin.setDecimals(4)
+        self.allowed_spin.setSingleStep(0.01)
+        self.allowed_spin.setValue(0.0)
+        self.allowed_spin.setToolTip("Allowed different-pixel percent before a slide is DIFF. 0 strict; 0.01-0.05 tolerates tiny render noise.")
 
         self.only_diff_check = QCheckBox("Only different slides")
         self.only_diff_check.setChecked(True)
@@ -135,6 +161,16 @@ class ReportDiffWindow(QMainWindow):
 
         self.run_button = QPushButton("Run compare")
         self.run_button.clicked.connect(self.run_compare)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Ready")
+
+        self.help_box = QTextEdit()
+        self.help_box.setReadOnly(True)
+        self.help_box.setMaximumHeight(150)
+        self.help_box.setPlainText(HELP_TEXT)
 
         self.slide_list = QListWidget()
         self.slide_list.currentItemChanged.connect(self.slide_selected)
@@ -168,6 +204,9 @@ class ReportDiffWindow(QMainWindow):
         left_layout.addLayout(form)
         left_layout.addWidget(self.only_diff_check)
         left_layout.addWidget(self.run_button)
+        left_layout.addWidget(self.progress_bar)
+        left_layout.addWidget(QLabel("Parameter guide"))
+        left_layout.addWidget(self.help_box)
         left_layout.addWidget(QLabel("Slides"))
         left_layout.addWidget(self.slide_list, 1)
 
@@ -226,6 +265,8 @@ class ReportDiffWindow(QMainWindow):
         self.detail_box.clear()
         self.preview.label.setText("Running compare...")
         self.preview._pixmap = None
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0% - Starting")
         self.statusBar().showMessage("Comparing reports. PowerPoint may take a moment...")
 
         self.worker_thread = QThread(self)
@@ -234,17 +275,25 @@ class ReportDiffWindow(QMainWindow):
         self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.compare_finished)
         self.worker.failed.connect(self.compare_failed)
+        self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
 
+    def update_progress(self, percent: int, message: str) -> None:
+        self.progress_bar.setValue(percent)
+        self.progress_bar.setFormat("{}% - {}".format(percent, message))
+        self.statusBar().showMessage(message)
+
     def compare_finished(self, pixel_results, object_diffs, output_dir: str) -> None:
         self.pixel_results = list(pixel_results)
         self.object_diffs = list(object_diffs)
         self.output_dir = output_dir
         self.run_button.setEnabled(True)
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("100% - Done")
         self.populate_slide_list()
         diff_pages = len([result for result in self.pixel_results if not result.passed])
         self.statusBar().showMessage(
@@ -257,6 +306,7 @@ class ReportDiffWindow(QMainWindow):
 
     def compare_failed(self, message: str) -> None:
         self.run_button.setEnabled(True)
+        self.progress_bar.setFormat("Failed")
         self.statusBar().showMessage("Compare failed")
         self.detail_box.setPlainText(message)
         QMessageBox.critical(self, "Compare failed", message.splitlines()[-1] if message else "Unknown error")

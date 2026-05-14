@@ -27,9 +27,9 @@ Workflow:
 2. Select the actual PPT/PPTX report.
 3. Keep output as `output` so all generated files stay inside the downloaded package.
 4. Click `Run compare`.
-5. Use the slide list to view only different slides.
+5. Watch the progress bar for current processing status and percent.\n6. Use the slide list to view only different slides.
 
-The GUI highlights differences with red rectangle regions using 20% transparent fill and a strong red border. This is easier to inspect than per-pixel red noise.
+The GUI includes inline explanations for Pixel threshold, DPI, and Allowed diff %. It highlights differences with red rectangle regions using 20% transparent fill and a strong red border. This is easier to inspect than per-pixel red noise.
 ## Install
 
 Use Python 3.9+.
@@ -100,6 +100,7 @@ Pixel comparison catches the final visual result, including charts, images, font
 Object comparison catches changes in PPTX shape order, position, size, text, and embedded image content without relying on screenshot rendering. It is useful for precise automation, but it may not fully understand complex charts, SmartArt, grouped objects, or effects.
 
 Use `--mode both` when the report quality gate matters: pixel diff verifies the visual output, and object diff explains many structural changes.
+
 
 
 

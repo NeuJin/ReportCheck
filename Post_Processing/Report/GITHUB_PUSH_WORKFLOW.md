@@ -124,7 +124,7 @@ The machine also needs Microsoft PowerPoint installed because slide image export
 
 ## 4. Run Report Comparison
 
-Recommended GUI command:
+Recommended GUI command. The GUI shows a progress bar and explanations for Pixel threshold, DPI, and Allowed diff %:
 
 ```powershell
 python report_diff_gui.py
@@ -168,5 +168,6 @@ Exit codes:
 1 = differences found
 2 = runtime/input error
 ```
+
 
 
