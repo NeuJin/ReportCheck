@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 
 PPT_EXTS = {".ppt", ".pptx"}
@@ -326,20 +326,35 @@ def compare_page(
 
 
 def slide_signature(image: Image.Image, size: Tuple[int, int] = (64, 36)) -> Image.Image:
-    return image.convert("L").resize(size)
+    return image.convert("L").resize(size, Image.BILINEAR)
 
 
-def slide_similarity(expected: Image.Image, actual: Image.Image) -> float:
-    left = slide_signature(expected)
-    right = slide_signature(actual)
-    diff = ImageChops.difference(left, right)
+def _norm_similarity(img1: Image.Image, img2: Image.Image) -> float:
+    """Normalized mean absolute similarity between two same-size grayscale images."""
+    diff = ImageChops.difference(img1, img2)
     histogram = diff.histogram()
     total = sum(histogram)
     if total == 0:
         return 1.0
-    difference_sum = sum(value * count for value, count in enumerate(histogram))
-    mean_difference = difference_sum / float(total)
-    return max(0.0, 1.0 - (mean_difference / 255.0))
+    diff_sum = sum(value * count for value, count in enumerate(histogram))
+    return max(0.0, 1.0 - diff_sum / (float(total) * 255.0))
+
+
+def _edge_signature(image: Image.Image, size: Tuple[int, int] = (64, 36)) -> Image.Image:
+    """Edge-based structural signature — captures layout boundaries independent of content."""
+    return image.convert("L").filter(ImageFilter.FIND_EDGES).resize(size, Image.BILINEAR)
+
+
+def slide_similarity(expected: Image.Image, actual: Image.Image) -> float:
+    """Multi-metric similarity: pixel content (60%) + structural layout edges (40%).
+
+    The structural component lets slides with the same layout/concept score higher
+    even when their text or chart content differs, improving cross-version alignment.
+    """
+    size = (64, 36)
+    pixel_sim = _norm_similarity(slide_signature(expected, size), slide_signature(actual, size))
+    struct_sim = _norm_similarity(_edge_signature(expected, size), _edge_signature(actual, size))
+    return 0.60 * pixel_sim + 0.40 * struct_sim
 
 
 def align_slide_pages(
@@ -387,11 +402,12 @@ def align_slide_pages(
         current = step[i][j]
         if current == "matched":
             score = scores[i - 1][j - 1]
-            if score >= min_match_score:
-                matches.append(SlideMatch(i - 1, j - 1, score, "matched"))
-            else:
-                matches.append(SlideMatch(i - 1, None, None, "missing_actual"))
-                matches.append(SlideMatch(None, j - 1, None, "extra_actual"))
+            # Trust the DP decision — if it chose to match, we compare these two slides.
+            # Only label as low_confidence when score is below the threshold so the user
+            # can see it clearly, but we do NOT split into missing+extra (that defeats the
+            # purpose of the alignment algorithm).
+            status = "matched" if score >= min_match_score else "low_confidence_match"
+            matches.append(SlideMatch(i - 1, j - 1, score, status))
             i -= 1
             j -= 1
         elif current == "missing_actual" or j == 0:

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 from PySide2.QtCore import QObject, QSize, Qt, QThread, Signal, QEvent
-from PySide2.QtGui import QPixmap
+from PySide2.QtGui import QBrush, QColor, QPixmap
 from PySide2.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -443,16 +443,22 @@ class ReportDiffWindow(QMainWindow):
                 continue
             if only_diff and result.passed:
                 continue
+            score_str = "{:.0f}%".format(result.match_score * 100) if result.match_score is not None else "-"
             item = QListWidgetItem(
-                "Pair {:03d} | E:{} -> A:{} | {} | diff {:.6f}% | {} regions".format(
+                "Pair {:03d} | E:{} -> A:{} | {} | sim {} | diff {:.4f}% | {} regions".format(
                     result.page,
                     result.expected_page if result.expected_page is not None else "-",
                     result.actual_page if result.actual_page is not None else "-",
                     result.match_status,
+                    score_str,
                     result.difference_percent,
                     len(result.regions),
                 )
             )
+            if result.match_status == "low_confidence_match":
+                item.setForeground(QBrush(QColor(180, 100, 0)))  # amber — matched but low sim score
+            elif result.match_status in ("extra_actual", "missing_actual"):
+                item.setForeground(QBrush(QColor(140, 140, 140)))  # gray — unmatched
             item.setData(Qt.UserRole, result)
             self.slide_list.addItem(item)
 
@@ -520,10 +526,18 @@ class ReportDiffWindow(QMainWindow):
             ]
             self.detail_box.setPlainText("\n".join(details))
             return
+        score_str = (
+            "{:.2f}% (low confidence — same layout/concept?)".format(result.match_score * 100)
+            if result.match_status == "low_confidence_match" and result.match_score is not None
+            else "{:.2f}%".format(result.match_score * 100) if result.match_score is not None
+            else "-"
+        )
         details = [
             "Pair: {}".format(result.page),
             "Expected page: {}".format(result.expected_page if result.expected_page is not None else "-"),
             "Actual page: {}".format(result.actual_page if result.actual_page is not None else "-"),
+            "Match status: {}".format(result.match_status),
+            "Similarity score: {}".format(score_str),
             "Status: {}".format("PASS" if result.passed else "DIFFERENT"),
             "Different pixels: {} / {}".format(result.different_pixels, result.compared_pixels),
             "Difference percent: {:.6f}%".format(result.difference_percent),
