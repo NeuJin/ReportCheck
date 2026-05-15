@@ -287,7 +287,7 @@ class ReportDiffWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ReportCheck - PPT Slide Diff")
-        self.resize(1240, 800)
+        self.resize(1480, 860)
 
         self.pixel_results = []
         self.object_diffs = []
@@ -547,55 +547,59 @@ class ReportDiffWindow(QMainWindow):
         # Top: Expected | [Pair] | Actual lists side by side.
         # Below: preview toolbar, preview, details.
 
+        # ── Far-right strip: two narrow slide-list columns + Pair button below ──
+        # Mimics PowerPoint's slide navigator. Kept narrow so the centre
+        # comparison area takes the bulk of the window.
         expected_box = QWidget()
         ev = QVBoxLayout(expected_box)
         ev.setContentsMargins(0, 0, 0, 0)
         ev.setSpacing(2)
-        ev.addWidget(QLabel("Expected slides"))
+        ev.addWidget(QLabel("Expected"))
         ev.addWidget(self.expected_list, 1)
 
         actual_box = QWidget()
         av = QVBoxLayout(actual_box)
         av.setContentsMargins(0, 0, 0, 0)
         av.setSpacing(2)
-        av.addWidget(QLabel("Actual slides"))
+        av.addWidget(QLabel("Actual"))
         av.addWidget(self.actual_list, 1)
-
-        pair_button_box = QWidget()
-        pb = QVBoxLayout(pair_button_box)
-        pb.setContentsMargins(4, 4, 4, 4)
-        pb.addStretch(1)
-        pb.addWidget(self.pair_selected_button)
-        pb.addStretch(1)
 
         lists_splitter = QSplitter(Qt.Horizontal)
         lists_splitter.addWidget(expected_box)
-        lists_splitter.addWidget(pair_button_box)
         lists_splitter.addWidget(actual_box)
         lists_splitter.setStretchFactor(0, 1)
-        lists_splitter.setStretchFactor(1, 0)
-        lists_splitter.setStretchFactor(2, 1)
+        lists_splitter.setStretchFactor(1, 1)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.addWidget(lists_splitter, 3)
+        far_right = QWidget()
+        fr_layout = QVBoxLayout(far_right)
+        fr_layout.setContentsMargins(4, 4, 4, 4)
+        fr_layout.setSpacing(4)
+        fr_layout.addWidget(lists_splitter, 1)
+        fr_layout.addWidget(self.pair_selected_button)
 
+        # ── Centre: main comparison window (preview + details) ──
+        centre = QWidget()
+        centre_layout = QVBoxLayout(centre)
         preview_toolbar = QHBoxLayout()
         preview_toolbar.addWidget(QLabel("View"))
         preview_toolbar.addWidget(self.view_overlay_button)
         preview_toolbar.addWidget(self.toggle_original_button)
         preview_toolbar.addWidget(self.original_status_label)
         preview_toolbar.addStretch(1)
-        right_layout.addLayout(preview_toolbar)
-        right_layout.addWidget(self.preview, 4)
-        right_layout.addWidget(QLabel("Details"))
-        right_layout.addWidget(self.detail_box, 1)
+        centre_layout.addLayout(preview_toolbar)
+        centre_layout.addWidget(self.preview, 4)
+        centre_layout.addWidget(QLabel("Details"))
+        centre_layout.addWidget(self.detail_box, 1)
 
+        # Three-column main splitter: settings/pairs | comparison | slide strip
         splitter = QSplitter()
         splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        splitter.addWidget(centre)
+        splitter.addWidget(far_right)
+        splitter.setStretchFactor(0, 0)  # settings/pairs panel stays its natural width
+        splitter.setStretchFactor(1, 1)  # comparison area absorbs extra space
+        splitter.setStretchFactor(2, 0)  # slide-list strip stays narrow
+        splitter.setSizes([340, 820, 240])
         self.setCentralWidget(splitter)
 
     def _path_row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
@@ -705,6 +709,8 @@ class ReportDiffWindow(QMainWindow):
                 lambda: self._force_pair_with_expected(result),
             )
         menu.addSeparator()
+        menu.addAction("Delete this pair", lambda: self._delete_current_pair(result))
+        menu.addSeparator()
         menu.addAction("Clear all manual overrides", self._clear_all_overrides)
         menu.exec_(self.slide_list.viewport().mapToGlobal(position))
 
@@ -775,6 +781,30 @@ class ReportDiffWindow(QMainWindow):
         self.manual_overrides.clear()
         self.overrides_edit.clear()
         self.statusBar().showMessage("All manual overrides cleared.", 4000)
+
+    def _delete_current_pair(self, result) -> None:
+        """Drop a pair from the list. If it was matched, the deletion is recorded
+        as a 'force missing' override so the next Run preserves the user's
+        choice. The freed slides remain visible in the Expected/Actual columns
+        on the right so they can be re-paired with one click."""
+        try:
+            self.pixel_results.remove(result)
+        except ValueError:
+            return
+
+        if result.expected_page is not None and result.actual_page is not None:
+            # Was an actual pairing — sticky-delete it so a re-Run doesn't
+            # auto-recreate it from the same scores.
+            self.manual_overrides[result.expected_page - 1] = None
+            self._mark_overrides_pending()
+
+        self._renumber_pairs()
+        self.populate_slide_list()
+        self._update_summary()
+        self.statusBar().showMessage(
+            "Pair deleted. Both slides remain in the side columns for re-pairing.",
+            5000,
+        )
 
     # ── Visual pair-by-click between Expected / Actual lists ──────────────
 
