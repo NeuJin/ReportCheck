@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dành cho Usagi san ♡</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Dancing+Script:wght@600;700&family=Nunito:wght@400;600;700&display=swap');
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      background: linear-gradient(135deg, #1a0533 0%, #2d0b4e 40%, #1a1040 100%);
+      font-family: 'Nunito', sans-serif;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ── Stars ── */
+    #stars-canvas {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Floating hearts ── */
+    .floating-heart {
+      position: fixed;
+      font-size: 1.4rem;
+      animation: floatUp linear infinite;
+      opacity: 0;
+      pointer-events: none;
+      z-index: 1;
+    }
+    @keyframes floatUp {
+      0%   { transform: translateY(0) scale(0.7) rotate(-15deg); opacity: 0; }
+      10%  { opacity: 0.85; }
+      90%  { opacity: 0.6; }
+      100% { transform: translateY(-105vh) scale(1.1) rotate(15deg); opacity: 0; }
+    }
+
+    /* ── Card ── */
+    .card {
+      position: relative;
+      z-index: 10;
+      background: rgba(255,255,255,0.06);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 28px;
+      padding: 48px 44px;
+      max-width: 520px;
+      width: 90%;
+      text-align: center;
+      box-shadow: 0 8px 60px rgba(200, 80, 200, 0.25), 0 2px 12px rgba(0,0,0,0.4);
+      animation: fadeInUp 1.2s cubic-bezier(0.22,1,0.36,1) both;
+    }
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(60px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── Usagi bunny ── */
+    .bunny-wrap {
+      font-size: 5rem;
+      margin-bottom: 4px;
+      animation: bunnyBounce 2.4s ease-in-out infinite;
+      display: inline-block;
+    }
+    @keyframes bunnyBounce {
+      0%,100% { transform: translateY(0) rotate(-3deg); }
+      50%      { transform: translateY(-12px) rotate(3deg); }
+    }
+
+    .nickname {
+      font-family: 'Dancing Script', cursive;
+      font-size: 2rem;
+      color: #f9b8f9;
+      margin-bottom: 6px;
+      text-shadow: 0 0 18px rgba(249,90,249,0.6);
+      letter-spacing: 1px;
+    }
+
+    .full-name {
+      font-size: 0.95rem;
+      color: rgba(255,255,255,0.55);
+      margin-bottom: 28px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+
+    /* ── Progress bar ── */
+    .day-progress-label {
+      font-size: 0.8rem;
+      color: rgba(255,255,255,0.5);
+      margin-bottom: 6px;
+      text-align: left;
+    }
+    .day-progress-bar {
+      width: 100%;
+      height: 6px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 28px;
+    }
+    .day-progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #e879f9, #f472b6);
+      border-radius: 999px;
+      transition: width 2s cubic-bezier(0.22,1,0.36,1);
+      box-shadow: 0 0 8px #e879f9;
+    }
+
+    /* ── Message ── */
+    .message {
+      color: rgba(255,255,255,0.88);
+      font-size: 1.08rem;
+      line-height: 1.85;
+      margin-bottom: 32px;
+      text-align: left;
+    }
+    .message em {
+      color: #f9b8f9;
+      font-style: normal;
+      font-weight: 700;
+    }
+
+    /* ── Badges ── */
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+      margin-bottom: 32px;
+    }
+    .badge {
+      background: rgba(233,121,249,0.15);
+      border: 1px solid rgba(233,121,249,0.35);
+      color: #f9b8f9;
+      border-radius: 999px;
+      padding: 6px 16px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    /* ── Button ── */
+    .hug-btn {
+      background: linear-gradient(135deg, #a855f7, #ec4899);
+      color: #fff;
+      border: none;
+      border-radius: 999px;
+      padding: 14px 36px;
+      font-size: 1rem;
+      font-family: 'Nunito', sans-serif;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 4px 24px rgba(168,85,247,0.45);
+      transition: transform 0.15s, box-shadow 0.15s;
+      letter-spacing: 0.5px;
+    }
+    .hug-btn:hover  { transform: translateY(-3px) scale(1.04); box-shadow: 0 8px 32px rgba(168,85,247,0.6); }
+    .hug-btn:active { transform: scale(0.97); }
+
+    /* ── Burst modal ── */
+    .burst-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s;
+    }
+    .burst-overlay.show { opacity: 1; pointer-events: all; }
+    .burst-card {
+      background: linear-gradient(135deg, #2d0b4e, #1a1040);
+      border: 1px solid rgba(249,184,249,0.3);
+      border-radius: 24px;
+      padding: 40px 36px;
+      max-width: 360px;
+      width: 88%;
+      text-align: center;
+      transform: scale(0.8);
+      transition: transform 0.35s cubic-bezier(0.22,1,0.36,1);
+    }
+    .burst-overlay.show .burst-card { transform: scale(1); }
+    .burst-emoji { font-size: 3.5rem; margin-bottom: 12px; }
+    .burst-title {
+      font-family: 'Dancing Script', cursive;
+      font-size: 1.8rem;
+      color: #f9b8f9;
+      margin-bottom: 12px;
+    }
+    .burst-msg {
+      color: rgba(255,255,255,0.8);
+      font-size: 0.95rem;
+      line-height: 1.7;
+      margin-bottom: 20px;
+    }
+    .burst-close {
+      background: rgba(255,255,255,0.1);
+      color: #f9b8f9;
+      border: 1px solid rgba(249,184,249,0.3);
+      border-radius: 999px;
+      padding: 8px 24px;
+      font-size: 0.9rem;
+      font-family: 'Nunito', sans-serif;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .burst-close:hover { background: rgba(255,255,255,0.18); }
+
+    /* ── Footer ── */
+    .footer {
+      position: relative;
+      z-index: 10;
+      margin-top: 20px;
+      font-size: 0.78rem;
+      color: rgba(255,255,255,0.28);
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+
+<canvas id="stars-canvas"></canvas>
+
+<!-- Card -->
+<div class="card">
+  <div class="bunny-wrap">🐰</div>
+
+  <div class="nickname">Usagi san ♡</div>
+  <div class="full-name">Quỳnh Anh</div>
+
+  <div class="day-progress-label">Hôm nay bạn đã vượt qua được…</div>
+  <div class="day-progress-bar">
+    <div class="day-progress-fill" id="progressFill" style="width:0%"></div>
+  </div>
+
+  <div class="message">
+    Này Usagi san, <em>hôm nay bạn đã thật sự rất vất vả</em> — vừa đi làm,
+    vừa học, chạy từ sáng đến tối mà vẫn không kêu ca một câu nào.
+    <br/><br/>
+    Mình biết bạn mệt lắm. Nhưng mình cũng biết bạn đã <em>cố gắng hết mình</em>
+    rồi đó. Mỗi ngày bạn tiến thêm một bước, dù nhỏ thôi, cũng làm mình tự hào
+    ghê lắm.
+    <br/><br/>
+    Bây giờ hãy thở sâu, duỗi chân ra, để mình <em>gửi tới bạn một cái ôm thật chặt</em> nhé 🫶
+  </div>
+
+  <div class="badges">
+    <span class="badge">💪 Cứng rắn</span>
+    <span class="badge">📚 Chăm chỉ</span>
+    <span class="badge">✨ Giỏi lắm</span>
+    <span class="badge">🌙 Ngủ ngon nha</span>
+  </div>
+
+  <button class="hug-btn" onclick="sendHug()">Gửi một cái ôm 🤗</button>
+</div>
+
+<div class="footer">Made with ♡ · Chỉ dành riêng cho Usagi san</div>
+
+<!-- Burst modal -->
+<div class="burst-overlay" id="burstOverlay">
+  <div class="burst-card">
+    <div class="burst-emoji">🫶🐰💜</div>
+    <div class="burst-title">Ôm thật chặt!</div>
+    <div class="burst-msg">
+      Usagi san ơi, bạn đã làm rất tốt hôm nay rồi.<br/>
+      Cảm ơn vì đã không bỏ cuộc nha.<br/><br/>
+      Đêm nay ngủ thật ngon nhé — ngày mai mình cùng cố tiếp! 🌙✨
+    </div>
+    <button class="burst-close" onclick="closeHug()">Cảm ơn ♡</button>
+  </div>
+</div>
+
+<script>
+  /* ── Stars ── */
+  const canvas = document.getElementById('stars-canvas');
+  const ctx = canvas.getContext('2d');
+  let stars = [];
+
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', () => { resize(); initStars(); });
+  resize();
+
+  function initStars() {
+    stars = Array.from({ length: 140 }, () => ({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      r: Math.random() * 1.4 + 0.3,
+      a: Math.random(),
+      speed: Math.random() * 0.005 + 0.002,
+      phase: Math.random() * Math.PI * 2,
+    }));
+  }
+  initStars();
+
+  function drawStars(t) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (const s of stars) {
+      const alpha = 0.3 + 0.7 * Math.abs(Math.sin(s.phase + t * s.speed));
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,220,255,${alpha})`;
+      ctx.fill();
+    }
+    requestAnimationFrame(drawStars);
+  }
+  requestAnimationFrame(drawStars);
+
+  /* ── Floating hearts spawn ── */
+  const heartChars = ['♡','♥','💜','💗','💕','🌸'];
+  function spawnHeart() {
+    const el = document.createElement('div');
+    el.className = 'floating-heart';
+    el.textContent = heartChars[Math.floor(Math.random() * heartChars.length)];
+    el.style.left = Math.random() * 100 + 'vw';
+    const dur = 7 + Math.random() * 8;
+    el.style.animationDuration = dur + 's';
+    el.style.animationDelay = Math.random() * 4 + 's';
+    el.style.fontSize = (1 + Math.random() * 1.2) + 'rem';
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), (dur + 4) * 1000);
+  }
+  setInterval(spawnHeart, 900);
+  for (let i = 0; i < 5; i++) spawnHeart();
+
+  /* ── Progress bar ── */
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+      document.getElementById('progressFill').style.width = '100%';
+    }, 400);
+  });
+
+  /* ── Hug modal ── */
+  function sendHug() {
+    document.getElementById('burstOverlay').classList.add('show');
+    burstHearts();
+  }
+  function closeHug() {
+    document.getElementById('burstOverlay').classList.remove('show');
+  }
+  document.getElementById('burstOverlay').addEventListener('click', function(e) {
+    if (e.target === this) closeHug();
+  });
+
+  function burstHearts() {
+    for (let i = 0; i < 18; i++) spawnHeart();
+  }
+</script>
+</body>
+</html>
