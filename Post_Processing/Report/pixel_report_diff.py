@@ -31,6 +31,12 @@ PPTX_EXT = ".pptx"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 EMU_PER_POINT = 12700
 DEFAULT_OUTPUT_DIR = "output"
+DEFAULT_GAP_PENALTY = -0.12
+SIGNATURE_SIZE = (128, 72)
+BLOCK_GRID = (8, 6)
+COLOR_BINS = 8
+WHITE_THRESHOLD = 240  # gray >= this counts as blank background, below = slide content
+EDGE_THRESHOLD = 32  # edge response above this counts as a structural edge
 
 
 @dataclass
@@ -65,11 +71,29 @@ class SlideMatch:
 
 @dataclass
 class ObjectDiff:
-    slide: int
+    pair_index: int                  # 1-based pair number, matches PageDiff.page
+    expected_slide: Optional[int]    # 1-based slide number in the expected report
+    actual_slide: Optional[int]      # 1-based slide number in the actual report
     object_index: int
     field: str
     expected: Any
     actual: Any
+
+
+@dataclass
+class SlideSignature:
+    """Cached per-slide features, reused across the N×M alignment comparison.
+
+    Every feature here is *content-focused* — it ignores the blank background so
+    two unrelated slides that happen to share lots of whitespace are not scored
+    as similar.
+    """
+
+    content_mask: Image.Image       # binary: where the slide has non-white content
+    edge_mask: Image.Image          # binary: structural edges (chart frames, dividers)
+    block_ink: List[float]          # ink ratio in [0, 1] per grid cell
+    content_color_hist: List[float]  # colour distribution over content pixels only
+    text: Optional[str]
 
 
 def parse_color(value: str) -> Tuple[int, int, int]:
@@ -325,55 +349,202 @@ def compare_page(
 
 
 
-def slide_signature(image: Image.Image, size: Tuple[int, int] = (64, 36)) -> Image.Image:
-    return image.convert("L").resize(size, Image.BILINEAR)
+def _content_mask(image: Image.Image, size: Tuple[int, int] = SIGNATURE_SIZE) -> Image.Image:
+    """Binary mask (0/255) marking where the slide carries content vs. blank paper.
+
+    Report slides are mostly white. If we compare whole thumbnails, the matching
+    white background drowns out the few percent of pixels that actually differ,
+    so unrelated slides score deceptively high. Reducing each slide to *where the
+    ink is* makes the comparison about content, not paper.  A light dilation adds
+    tolerance to a few pixels of render jitter.
+    """
+    gray = image.convert("L").resize(size, Image.BILINEAR)
+    mask = gray.point(lambda value: 255 if value < WHITE_THRESHOLD else 0)
+    return mask.filter(ImageFilter.MaxFilter(3))
 
 
-def _norm_similarity(img1: Image.Image, img2: Image.Image) -> float:
-    """Normalized mean absolute similarity between two same-size grayscale images."""
-    diff = ImageChops.difference(img1, img2)
-    histogram = diff.histogram()
-    total = sum(histogram)
+def _edge_mask(image: Image.Image, size: Tuple[int, int] = SIGNATURE_SIZE) -> Image.Image:
+    """Binary mask of structural edges — chart frames, table borders, dividers.
+
+    FIND_EDGES runs on the full-resolution image (before the downscale) so thin
+    boundaries survive; the result is thresholded to a clean on/off edge map.
+    """
+    edges = image.convert("L").filter(ImageFilter.FIND_EDGES).resize(size, Image.BILINEAR)
+    mask = edges.point(lambda value: 255 if value > EDGE_THRESHOLD else 0)
+    return mask.filter(ImageFilter.MaxFilter(3))
+
+
+def _mask_iou(mask_a: Image.Image, mask_b: Image.Image) -> float:
+    """Intersection-over-union of two binary masks — measures spatial overlap.
+
+    This is the core layout signal: content in the same places => high IoU;
+    content arranged differently => low IoU, regardless of how much whitespace
+    the two slides share.
+    """
+    intersection = ImageChops.darker(mask_a, mask_b)
+    union = ImageChops.lighter(mask_a, mask_b)
+    intersection_count = sum(c for v, c in enumerate(intersection.histogram()) if v > 0)
+    union_count = sum(c for v, c in enumerate(union.histogram()) if v > 0)
+    if union_count == 0:
+        return 1.0  # both slides are blank
+    return intersection_count / union_count
+
+
+def _block_ink_ratios(image: Image.Image, grid: Tuple[int, int] = BLOCK_GRID) -> List[float]:
+    """Fraction of content (non-white) pixels in each grid cell, range [0, 1].
+
+    Unlike mean brightness — where a 95%-white cell and a 90%-white cell differ
+    by a negligible 4% — ink ratio spans the full [0, 1] range, so a cell with a
+    dense chart reads very differently from a near-empty one.
+    """
+    gray = image.convert("L")
+    cols, rows = grid
+    width, height = gray.size
+    ratios: List[float] = []
+    for row in range(rows):
+        for col in range(cols):
+            box = (
+                width * col // cols,
+                height * row // rows,
+                width * (col + 1) // cols,
+                height * (row + 1) // rows,
+            )
+            histogram = gray.crop(box).histogram()
+            total = sum(histogram) or 1
+            ink = sum(c for v, c in enumerate(histogram) if v < WHITE_THRESHOLD)
+            ratios.append(ink / total)
+    return ratios
+
+
+def _block_ink_similarity(ratios_a: Sequence[float], ratios_b: Sequence[float]) -> float:
+    if not ratios_a or not ratios_b or len(ratios_a) != len(ratios_b):
+        return 0.0
+    mean_diff = sum(abs(a - b) for a, b in zip(ratios_a, ratios_b)) / len(ratios_a)
+    return max(0.0, 1.0 - mean_diff)
+
+
+def _content_color_histogram(image: Image.Image, bins: int = COLOR_BINS) -> List[float]:
+    """Quantized RGB histogram over *content* pixels only — the white background
+    is excluded so the distribution reflects what is actually drawn.
+
+    A slide of red/green/yellow polar curves then has a genuinely different
+    colour profile from a blue line graph, instead of both being "mostly white".
+    """
+    rgb = image.convert("RGB").resize((96, 54), Image.BILINEAR)
+    bucket = 256 // bins
+    hist = [0] * (bins * 3)
+    for r, g, b in rgb.getdata():
+        if r >= WHITE_THRESHOLD and g >= WHITE_THRESHOLD and b >= WHITE_THRESHOLD:
+            continue
+        hist[min(bins - 1, r // bucket)] += 1
+        hist[bins + min(bins - 1, g // bucket)] += 1
+        hist[bins * 2 + min(bins - 1, b // bucket)] += 1
+    total = sum(hist)
     if total == 0:
+        return [0.0] * (bins * 3)
+    return [value / total for value in hist]
+
+
+def _histogram_intersection(hist_a: Sequence[float], hist_b: Sequence[float]) -> float:
+    if len(hist_a) != len(hist_b):
+        return 0.0
+    return sum(min(a, b) for a, b in zip(hist_a, hist_b))
+
+
+def _char_bigrams(text: str) -> set:
+    """Character bigrams — works for CJK text where whitespace tokenizing fails."""
+    compact = "".join(text.split()).lower()
+    if len(compact) < 2:
+        return {compact} if compact else set()
+    return {compact[index:index + 2] for index in range(len(compact) - 1)}
+
+
+def text_similarity(text_a: str, text_b: str) -> float:
+    """Jaccard similarity over character bigrams of two slides' text content."""
+    bigrams_a = _char_bigrams(text_a or "")
+    bigrams_b = _char_bigrams(text_b or "")
+    if not bigrams_a and not bigrams_b:
         return 1.0
-    diff_sum = sum(value * count for value, count in enumerate(histogram))
-    return max(0.0, 1.0 - diff_sum / (float(total) * 255.0))
+    if not bigrams_a or not bigrams_b:
+        return 0.0
+    union = len(bigrams_a | bigrams_b)
+    return len(bigrams_a & bigrams_b) / union if union else 0.0
 
 
-def _edge_signature(image: Image.Image, size: Tuple[int, int] = (64, 36)) -> Image.Image:
-    """Edge-based structural signature — captures layout boundaries independent of content."""
-    return image.convert("L").filter(ImageFilter.FIND_EDGES).resize(size, Image.BILINEAR)
+def compute_signature(image: Image.Image, text: Optional[str] = None) -> SlideSignature:
+    """Pre-compute every per-slide feature once so alignment can reuse them.
+
+    align_slide_pages compares every expected slide against every actual slide
+    (N×M); without caching, each slide's signatures would be recomputed N or M
+    times over.
+    """
+    return SlideSignature(
+        content_mask=_content_mask(image),
+        edge_mask=_edge_mask(image),
+        block_ink=_block_ink_ratios(image),
+        content_color_hist=_content_color_histogram(image),
+        text=text,
+    )
+
+
+def signature_similarity(expected: SlideSignature, actual: SlideSignature) -> float:
+    """Composite similarity in [0, 1] from all available per-slide signals.
+
+    Every component looks at *content*, never at the shared white background,
+    so the score reflects how alike the slides actually are:
+      40% layout — IoU of content masks (is the content in the same places?)
+      25% blocks — per-cell ink ratio (how is content distributed?)
+      20% edges  — IoU of structural edges (chart frames, dividers, tables)
+      15% colour — colour distribution over content pixels
+
+    When both slides carry text (PPTX inputs) it is the strongest signal there
+    is — a shared title almost always means a real match — so the final score
+    becomes 55% visual + 45% text.
+    """
+    layout_sim = _mask_iou(expected.content_mask, actual.content_mask)
+    block_sim = _block_ink_similarity(expected.block_ink, actual.block_ink)
+    edge_sim = _mask_iou(expected.edge_mask, actual.edge_mask)
+    color_sim = _histogram_intersection(expected.content_color_hist, actual.content_color_hist)
+    visual = 0.40 * layout_sim + 0.25 * block_sim + 0.20 * edge_sim + 0.15 * color_sim
+
+    if expected.text is not None and actual.text is not None:
+        return 0.55 * visual + 0.45 * text_similarity(expected.text, actual.text)
+    return visual
 
 
 def slide_similarity(expected: Image.Image, actual: Image.Image) -> float:
-    """Multi-metric similarity: pixel content (60%) + structural layout edges (40%).
-
-    The structural component lets slides with the same layout/concept score higher
-    even when their text or chart content differs, improving cross-version alignment.
-    """
-    size = (64, 36)
-    pixel_sim = _norm_similarity(slide_signature(expected, size), slide_signature(actual, size))
-    struct_sim = _norm_similarity(_edge_signature(expected, size), _edge_signature(actual, size))
-    return 0.60 * pixel_sim + 0.40 * struct_sim
+    """Convenience wrapper: composite visual similarity for two raw images."""
+    return signature_similarity(compute_signature(expected), compute_signature(actual))
 
 
-def align_slide_pages(
-    expected_pages: Sequence[Image.Image],
-    actual_pages: Sequence[Image.Image],
+def build_score_matrix(
+    expected_sigs: Sequence[SlideSignature],
+    actual_sigs: Sequence[SlideSignature],
+) -> List[List[float]]:
+    """Full N×M similarity matrix between every expected and actual slide."""
+    return [
+        [signature_similarity(expected_sig, actual_sig) for actual_sig in actual_sigs]
+        for expected_sig in expected_sigs
+    ]
+
+
+def align_from_score_matrix(
+    scores: Sequence[Sequence[float]],
+    expected_count: int,
+    actual_count: int,
     min_match_score: float,
+    gap_penalty: float = DEFAULT_GAP_PENALTY,
 ) -> List[SlideMatch]:
-    expected_count = len(expected_pages)
-    actual_count = len(actual_pages)
+    """Needleman–Wunsch style alignment over a precomputed similarity matrix.
+
+    Building the matrix once and feeding it here keeps scoring and alignment
+    separate, so the same matrix can also be exported for the user to audit.
+    """
     if expected_count == 0 and actual_count == 0:
         return []
 
-    scores = [
-        [slide_similarity(expected_pages[i], actual_pages[j]) for j in range(actual_count)]
-        for i in range(expected_count)
-    ]
-    gap_penalty = -0.05
-    dp = [[0.0 for _ in range(actual_count + 1)] for _ in range(expected_count + 1)]
-    step = [["" for _ in range(actual_count + 1)] for _ in range(expected_count + 1)]
+    dp = [[0.0] * (actual_count + 1) for _ in range(expected_count + 1)]
+    step = [[""] * (actual_count + 1) for _ in range(expected_count + 1)]
 
     for i in range(1, expected_count + 1):
         dp[i][0] = dp[i - 1][0] + gap_penalty
@@ -384,16 +555,13 @@ def align_slide_pages(
 
     for i in range(1, expected_count + 1):
         for j in range(1, actual_count + 1):
-            score = scores[i - 1][j - 1]
-            match_gain = score - min_match_score
+            match_gain = scores[i - 1][j - 1] - min_match_score
             candidates = (
                 (dp[i - 1][j - 1] + match_gain, "matched"),
                 (dp[i - 1][j] + gap_penalty, "missing_actual"),
                 (dp[i][j - 1] + gap_penalty, "extra_actual"),
             )
-            best_score, best_step = max(candidates, key=lambda item: item[0])
-            dp[i][j] = best_score
-            step[i][j] = best_step
+            dp[i][j], step[i][j] = max(candidates, key=lambda item: item[0])
 
     matches: List[SlideMatch] = []
     i = expected_count
@@ -402,10 +570,10 @@ def align_slide_pages(
         current = step[i][j]
         if current == "matched":
             score = scores[i - 1][j - 1]
-            # Trust the DP decision — if it chose to match, we compare these two slides.
-            # Only label as low_confidence when score is below the threshold so the user
-            # can see it clearly, but we do NOT split into missing+extra (that defeats the
-            # purpose of the alignment algorithm).
+            # Trust the DP: if it chose to match, we compare these two slides.
+            # A below-threshold score is flagged 'low_confidence_match' so the
+            # user can see it, but it is never split into missing+extra — that
+            # would throw away the alignment the DP just computed.
             status = "matched" if score >= min_match_score else "low_confidence_match"
             matches.append(SlideMatch(i - 1, j - 1, score, status))
             i -= 1
@@ -419,6 +587,29 @@ def align_slide_pages(
 
     matches.reverse()
     return matches
+
+
+def align_slide_pages(
+    expected_pages: Sequence[Image.Image],
+    actual_pages: Sequence[Image.Image],
+    min_match_score: float,
+    expected_texts: Optional[Sequence[str]] = None,
+    actual_texts: Optional[Sequence[str]] = None,
+    gap_penalty: float = DEFAULT_GAP_PENALTY,
+) -> List[SlideMatch]:
+    """Align two slide sequences by visual (and, when available, text) similarity."""
+    expected_sigs = [
+        compute_signature(page, _text_at(expected_texts, i))
+        for i, page in enumerate(expected_pages)
+    ]
+    actual_sigs = [
+        compute_signature(page, _text_at(actual_texts, j))
+        for j, page in enumerate(actual_pages)
+    ]
+    scores = build_score_matrix(expected_sigs, actual_sigs)
+    return align_from_score_matrix(
+        scores, len(expected_pages), len(actual_pages), min_match_score, gap_penalty
+    )
 
 
 def index_slide_pages(expected_pages: Sequence[Image.Image], actual_pages: Sequence[Image.Image]) -> List[SlideMatch]:
@@ -436,18 +627,120 @@ def index_slide_pages(expected_pages: Sequence[Image.Image], actual_pages: Seque
     return matches
 
 
-def compare_pixels(args: argparse.Namespace, output_dir: Path) -> List[PageDiff]:
+def _text_at(texts: Optional[Sequence[str]], index: int) -> Optional[str]:
+    if texts is None or index >= len(texts):
+        return None
+    return texts[index]
+
+
+def _maybe_load_slide_texts(path: Path) -> Optional[List[str]]:
+    """Per-slide text for PPTX inputs; None for images/PPT where text is unavailable."""
+    if path.suffix.lower() != PPTX_EXT:
+        return None
+    try:
+        return extract_slide_texts(path)
+    except Exception:
+        return None
+
+
+def write_similarity_matrix(
+    output_dir: Path,
+    scores: Sequence[Sequence[float]],
+    matches: Sequence[SlideMatch],
+    min_match_score: float,
+    text_used: bool,
+) -> None:
+    """Dump the full N×M similarity matrix and the chosen alignment as JSON.
+
+    This is the matcher's audit trail: the user can see *why* two slides were
+    paired — or why a slide was left unmatched — instead of trusting the result
+    blindly.
+    """
+    expected_count = len(scores)
+    actual_count = len(scores[0]) if scores and scores[0] else 0
+
+    best_match_per_expected = []
+    for i in range(expected_count):
+        row = scores[i]
+        if not row:
+            continue
+        best_j = max(range(len(row)), key=lambda j: row[j])
+        best_match_per_expected.append(
+            {
+                "expected_slide": i + 1,
+                "best_actual_slide": best_j + 1,
+                "score": round(row[best_j], 6),
+            }
+        )
+
+    payload = {
+        "expected_count": expected_count,
+        "actual_count": actual_count,
+        "min_match_score": min_match_score,
+        "text_signal_used": text_used,
+        "scores": [[round(value, 6) for value in row] for row in scores],
+        "best_match_per_expected": best_match_per_expected,
+        "alignment": [
+            {
+                "expected_slide": match.expected_index + 1 if match.expected_index is not None else None,
+                "actual_slide": match.actual_index + 1 if match.actual_index is not None else None,
+                "score": round(match.score, 6) if match.score is not None else None,
+                "status": match.status,
+            }
+            for match in matches
+        ],
+    }
+    (output_dir / "similarity_matrix.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def compare_pixels(
+    args: argparse.Namespace, output_dir: Path
+) -> Tuple[List[PageDiff], List[SlideMatch]]:
+    """Render & diff slides; returns per-pair diffs *and* the alignment used.
+
+    Returning the alignment lets the object-comparison pass reuse the same slide
+    pairing, so a reordered slide is not mistakenly diffed against the wrong
+    one.
+    """
+    expected_path = Path(args.expected)
+    actual_path = Path(args.actual)
+
     temp_root = Path(tempfile.mkdtemp(prefix="report_diff_render_"))
     try:
-        expected_pages = load_pages(Path(args.expected), args.dpi, temp_root / "expected")
-        actual_pages = load_pages(Path(args.actual), args.dpi, temp_root / "actual")
+        expected_pages = load_pages(expected_path, args.dpi, temp_root / "expected")
+        actual_pages = load_pages(actual_path, args.dpi, temp_root / "actual")
     finally:
         shutil.rmtree(str(temp_root), ignore_errors=True)
 
     min_match_score = getattr(args, "min_match_score", 0.82)
+    gap_penalty = getattr(args, "gap_penalty", DEFAULT_GAP_PENALTY)
     align_slides = bool(getattr(args, "align_slides", False))
+
     if align_slides:
-        matches = align_slide_pages(expected_pages, actual_pages, min_match_score)
+        expected_texts = _maybe_load_slide_texts(expected_path)
+        actual_texts = _maybe_load_slide_texts(actual_path)
+        # Text is only a usable matching signal when *both* reports expose it.
+        if expected_texts is None or actual_texts is None:
+            expected_texts = actual_texts = None
+
+        expected_sigs = [
+            compute_signature(page, _text_at(expected_texts, i))
+            for i, page in enumerate(expected_pages)
+        ]
+        actual_sigs = [
+            compute_signature(page, _text_at(actual_texts, j))
+            for j, page in enumerate(actual_pages)
+        ]
+        scores = build_score_matrix(expected_sigs, actual_sigs)
+        matches = align_from_score_matrix(
+            scores, len(expected_pages), len(actual_pages), min_match_score, gap_penalty
+        )
+        write_similarity_matrix(
+            output_dir, scores, matches, min_match_score, text_used=expected_texts is not None
+        )
     else:
         matches = index_slide_pages(expected_pages, actual_pages)
 
@@ -474,7 +767,7 @@ def compare_pixels(args: argparse.Namespace, output_dir: Path) -> List[PageDiff]
             )
         )
 
-    return results
+    return results, list(matches)
 
 
 def hash_bytes(data: bytes) -> str:
@@ -524,7 +817,63 @@ def extract_pptx_objects(path: Path) -> List[List[Dict[str, Any]]]:
     return slides
 
 
-def compare_objects(args: argparse.Namespace, output_dir: Path) -> List[ObjectDiff]:
+def extract_slide_texts(path: Path) -> List[str]:
+    """Concatenated text content per slide — a high-confidence matching signal.
+
+    Two slides that share a title (e.g. an analysis-conditions page) are almost
+    certainly the same slide across report versions, even if their charts moved.
+    """
+    slides = extract_pptx_objects(path)
+    return [
+        "\n".join(record["text"] for record in shapes if record.get("text"))
+        for shapes in slides
+    ]
+
+
+def align_pptx_by_text(
+    expected_path: Path,
+    actual_path: Path,
+    min_match_score: float,
+    gap_penalty: float = DEFAULT_GAP_PENALTY,
+    output_dir: Optional[Path] = None,
+) -> List[SlideMatch]:
+    """Align two PPTX files using text similarity only — no slide rendering.
+
+    For object-only comparisons we have no pixel signatures to work with, but
+    PPTX gives us the actual text per slide, which is usually a stronger signal
+    than visual matching anyway.  If ``output_dir`` is given, the score matrix
+    is exported for audit just like the visual path.
+    """
+    expected_texts = extract_slide_texts(expected_path)
+    actual_texts = extract_slide_texts(actual_path)
+    expected_count = len(expected_texts)
+    actual_count = len(actual_texts)
+    scores = [
+        [text_similarity(expected_texts[i], actual_texts[j]) for j in range(actual_count)]
+        for i in range(expected_count)
+    ]
+    matches = align_from_score_matrix(
+        scores, expected_count, actual_count, min_match_score, gap_penalty
+    )
+    if output_dir is not None:
+        write_similarity_matrix(output_dir, scores, matches, min_match_score, text_used=True)
+    return matches
+
+
+def compare_objects(
+    args: argparse.Namespace,
+    output_dir: Path,
+    matches: Optional[Sequence[SlideMatch]] = None,
+) -> List[ObjectDiff]:
+    """Diff shape-level data slide by slide, using a shared alignment when given.
+
+    If ``matches`` is provided (typically by an upstream pixel-comparison pass)
+    those exact slide pairings are reused, so reordered slides are diffed
+    against their real counterpart rather than against whatever happens to sit
+    at the same index. When ``matches`` is None this function computes its own
+    alignment: text-based for PPTX when ``--align-slides`` is on, otherwise the
+    historical index-based pairing.
+    """
     expected_path = Path(args.expected)
     actual_path = Path(args.actual)
     if expected_path.suffix.lower() != PPTX_EXT or actual_path.suffix.lower() != PPTX_EXT:
@@ -532,12 +881,33 @@ def compare_objects(args: argparse.Namespace, output_dir: Path) -> List[ObjectDi
 
     expected_slides = extract_pptx_objects(expected_path)
     actual_slides = extract_pptx_objects(actual_path)
-    slide_count = max(len(expected_slides), len(actual_slides))
-    diffs = []
 
-    for slide_index in range(slide_count):
-        expected_shapes = expected_slides[slide_index] if slide_index < len(expected_slides) else []
-        actual_shapes = actual_slides[slide_index] if slide_index < len(actual_slides) else []
+    if matches is None:
+        if bool(getattr(args, "align_slides", False)):
+            matches = align_pptx_by_text(
+                expected_path,
+                actual_path,
+                getattr(args, "min_match_score", 0.82),
+                getattr(args, "gap_penalty", DEFAULT_GAP_PENALTY),
+                output_dir=output_dir,
+            )
+        else:
+            matches = index_slide_pages(expected_slides, actual_slides)
+
+    diffs: List[ObjectDiff] = []
+    for pair_index, match in enumerate(matches, start=1):
+        expected_shapes = (
+            expected_slides[match.expected_index]
+            if match.expected_index is not None and match.expected_index < len(expected_slides)
+            else []
+        )
+        actual_shapes = (
+            actual_slides[match.actual_index]
+            if match.actual_index is not None and match.actual_index < len(actual_slides)
+            else []
+        )
+        expected_slide_no = match.expected_index + 1 if match.expected_index is not None else None
+        actual_slide_no = match.actual_index + 1 if match.actual_index is not None else None
         object_count = max(len(expected_shapes), len(actual_shapes))
 
         for object_index in range(object_count):
@@ -548,7 +918,9 @@ def compare_objects(args: argparse.Namespace, output_dir: Path) -> List[ObjectDi
                 if expected.get(field) != actual.get(field):
                     diffs.append(
                         ObjectDiff(
-                            slide=slide_index + 1,
+                            pair_index=pair_index,
+                            expected_slide=expected_slide_no,
+                            actual_slide=actual_slide_no,
                             object_index=object_index + 1,
                             field=field,
                             expected=expected.get(field),
@@ -652,8 +1024,10 @@ def print_summary(pixel_results: Iterable[PageDiff], object_diffs: Sequence[Obje
         print("Object differences: {}".format(len(object_diffs)))
         for diff in object_diffs[:20]:
             print(
-                "[OBJECT] slide={} object={} field={}".format(
-                    diff.slide,
+                "[OBJECT] pair={} expected_slide={} actual_slide={} object={} field={}".format(
+                    diff.pair_index,
+                    diff.expected_slide if diff.expected_slide is not None else "-",
+                    diff.actual_slide if diff.actual_slide is not None else "-",
                     diff.object_index,
                     diff.field,
                 )
@@ -692,6 +1066,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.82,
         help="Minimum visual similarity score for auto slide matching, 0.0 to 1.0",
+    )
+    parser.add_argument(
+        "--gap-penalty",
+        type=float,
+        default=DEFAULT_GAP_PENALTY,
+        help="Cost of leaving a slide unmatched during auto alignment; a more "
+        "negative value makes the matcher less willing to pair dissimilar slides",
     )
     parser.add_argument(
         "-t",
@@ -736,13 +1117,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_dir = resolve_output_dir(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        pixel_results = []
-        object_diffs = []
+        pixel_results: List[PageDiff] = []
+        object_diffs: List[ObjectDiff] = []
+        matches: Optional[List[SlideMatch]] = None
 
         if args.mode in ("pixel", "both"):
-            pixel_results = compare_pixels(args, output_dir)
+            pixel_results, matches = compare_pixels(args, output_dir)
         if args.mode in ("object", "both"):
-            object_diffs = compare_objects(args, output_dir)
+            object_diffs = compare_objects(args, output_dir, matches=matches)
 
         write_summary(output_dir, pixel_results, object_diffs)
     except Exception as exc:

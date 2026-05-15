@@ -47,6 +47,7 @@ HELP = {
     "allowed": "Allowed different-pixel percent before a slide is DIFF. 0 strict; 0.01-0.05 tolerates tiny render noise.",
     "align": "Match slides by visual similarity before diff. Use when report page counts or order differ.",
     "matching": "Minimum similarity percentage for auto matching. 82% is practical; raise if wrong slides match, lower if related slides do not match.",
+    "gap": "Penalty for leaving a slide unmatched during auto align. More negative = matcher pairs slides only when clearly similar; less negative = more eager to pair. -0.12 is the default.",
     "boxes": "Show or hide red highlight rectangles. Very large regions use lighter fill. Hover a visible rectangle to see its bbox/size.",
     "unmatched": "Hide pairs where one side has no matching slide, such as extra_actual or missing_actual.",
     "output": "Relative output folder inside this downloaded package only.",
@@ -71,13 +72,14 @@ class CompareWorker(QObject):
 
             pixel_results = []
             object_diffs = []
+            matches = None
             if self.args.mode in ("pixel", "both"):
                 self.progress.emit(20, "Rendering slides and comparing pixels...")
-                pixel_results = engine.compare_pixels(self.args, output_dir)
+                pixel_results, matches = engine.compare_pixels(self.args, output_dir)
                 self.progress.emit(70, "Pixel comparison complete.")
             if self.args.mode in ("object", "both"):
                 self.progress.emit(75, "Comparing PPTX objects...")
-                object_diffs = engine.compare_objects(self.args, output_dir)
+                object_diffs = engine.compare_objects(self.args, output_dir, matches=matches)
                 self.progress.emit(90, "Object comparison complete.")
 
             self.progress.emit(95, "Writing summary files...")
@@ -238,6 +240,13 @@ class ReportDiffWindow(QMainWindow):
         self.matching_spin.setSuffix(" %")
         self.matching_spin.setToolTip(HELP["matching"])
 
+        self.gap_penalty_spin = QDoubleSpinBox()
+        self.gap_penalty_spin.setRange(-1.0, 0.0)
+        self.gap_penalty_spin.setDecimals(2)
+        self.gap_penalty_spin.setSingleStep(0.01)
+        self.gap_penalty_spin.setValue(engine.DEFAULT_GAP_PENALTY)
+        self.gap_penalty_spin.setToolTip(HELP["gap"])
+
         self.show_boxes_check = QCheckBox("Show highlight boxes")
         self.show_boxes_check.setChecked(True)
         self.show_boxes_check.setToolTip(HELP["boxes"])
@@ -299,6 +308,7 @@ class ReportDiffWindow(QMainWindow):
         form.addRow("Allowed diff", self._control_with_help(self.allowed_spin, HELP["allowed"]))
         form.addRow("Auto align", self._control_with_help(self.align_check, HELP["align"]))
         form.addRow("Min Matching", self._control_with_help(self.matching_spin, HELP["matching"]))
+        form.addRow("Gap penalty", self._control_with_help(self.gap_penalty_spin, HELP["gap"]))
         form.addRow("Highlight", self._control_with_help(self.show_boxes_check, HELP["boxes"]))
         form.addRow("Unmatched", self._control_with_help(self.hide_unmatched_check, HELP["unmatched"]))
 
@@ -375,6 +385,7 @@ class ReportDiffWindow(QMainWindow):
             dpi=self.dpi_spin.value(),
             align_slides=self.align_check.isChecked(),
             min_match_score=float(self.matching_spin.value()) / 100.0,
+            gap_penalty=float(self.gap_penalty_spin.value()),
         )
 
     def run_compare(self) -> None:
@@ -556,15 +567,19 @@ class ReportDiffWindow(QMainWindow):
     def object_diff_text(self, slide: Optional[int] = None) -> str:
         diffs = self.object_diffs
         if slide is not None:
-            diffs = [diff for diff in diffs if diff.slide == slide]
+            # The pixel-side slide list keys on the expected slide number; filter
+            # object diffs the same way so the panel shows the right rows.
+            diffs = [diff for diff in diffs if diff.expected_slide == slide]
         if not diffs:
             return "Object differences: 0"
 
         lines = ["Object differences: {}".format(len(diffs))]
         for diff in diffs[:80]:
             lines.append(
-                "Slide {} | Object {} | {} | expected={!r} | actual={!r}".format(
-                    diff.slide,
+                "Pair {} | Exp:{} / Act:{} | Object {} | {} | expected={!r} | actual={!r}".format(
+                    diff.pair_index,
+                    diff.expected_slide if diff.expected_slide is not None else "-",
+                    diff.actual_slide if diff.actual_slide is not None else "-",
                     diff.object_index,
                     diff.field,
                     diff.expected,
