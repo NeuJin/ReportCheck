@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import traceback
 from types import SimpleNamespace
@@ -17,6 +19,8 @@ from PySide2.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -38,6 +42,29 @@ from PySide2.QtWidgets import (
 )
 
 import pixel_report_diff as engine
+
+
+# Preset profiles — one-click matching strictness for common scenarios.
+# (label, min_match_percent, gap_penalty, tooltip)
+MATCHING_PROFILES = [
+    ("Strict 95%",    95.0, -0.05,
+     "Near-identical reports only. Use when comparing minor edits to the same deck."),
+    ("Balanced 82%",  82.0, -0.12,
+     "Default — accepts small layout/colour changes; rejects unrelated slides."),
+    ("Cross-version 65%", 65.0, -0.18,
+     "Different test runs of the same template (different data, same boilerplate)."),
+    ("Permissive 50%", 50.0, -0.25,
+     "Cross-project matching. Many low-confidence matches; review carefully."),
+]
+
+# Status icons make the slide list scannable at a glance.
+MATCH_STATUS_ICON = {
+    "matched": "✓",
+    "low_confidence_match": "≈",
+    "missing_actual": "⊘",
+    "extra_actual": "+",
+    "same_index": "·",
+}
 
 
 HELP = {
@@ -275,6 +302,28 @@ class ReportDiffWindow(QMainWindow):
         self.run_button = QPushButton("Run compare")
         self.run_button.clicked.connect(self.run_compare)
 
+        self.open_output_button = QPushButton("Open output folder")
+        self.open_output_button.setEnabled(False)
+        self.open_output_button.setToolTip(
+            "Reveal the folder containing overlays, masks, and similarity_matrix.json"
+        )
+        self.open_output_button.clicked.connect(self.open_output_folder)
+
+        self.profile_buttons = []
+        for label, min_pct, gap, tip in MATCHING_PROFILES:
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            button.clicked.connect(
+                lambda _checked=False, m=min_pct, g=gap: self._apply_profile(m, g)
+            )
+            self.profile_buttons.append(button)
+
+        self.summary_label = QLabel("Run a comparison to see results.")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet(
+            "QLabel { padding: 6px; background: #f5f5f5; border: 1px solid #ddd; border-radius: 3px; }"
+        )
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -298,26 +347,62 @@ class ReportDiffWindow(QMainWindow):
         expected_button.clicked.connect(lambda: self.pick_file(self.expected_edit))
         actual_button.clicked.connect(lambda: self.pick_file(self.actual_edit))
 
-        form = QFormLayout()
-        form.addRow("Expected report", self._path_row(self.expected_edit, expected_button))
-        form.addRow("Actual report", self._path_row(self.actual_edit, actual_button))
-        form.addRow("Output folder", self._control_with_help(self.output_edit, HELP["output"]))
-        form.addRow("Mode", self._control_with_help(self.mode_combo, HELP["mode"]))
-        form.addRow("Pixel threshold", self._control_with_help(self.threshold_spin, HELP["threshold"]))
-        form.addRow("DPI", self._control_with_help(self.dpi_spin, HELP["dpi"]))
-        form.addRow("Allowed diff", self._control_with_help(self.allowed_spin, HELP["allowed"]))
-        form.addRow("Auto align", self._control_with_help(self.align_check, HELP["align"]))
-        form.addRow("Min Matching", self._control_with_help(self.matching_spin, HELP["matching"]))
-        form.addRow("Gap penalty", self._control_with_help(self.gap_penalty_spin, HELP["gap"]))
-        form.addRow("Highlight", self._control_with_help(self.show_boxes_check, HELP["boxes"]))
-        form.addRow("Unmatched", self._control_with_help(self.hide_unmatched_check, HELP["unmatched"]))
+        # ── Files ────────────────────────────────────────────────────────────
+        files_group = QGroupBox("Files")
+        files_form = QFormLayout(files_group)
+        files_form.addRow("Expected report", self._path_row(self.expected_edit, expected_button))
+        files_form.addRow("Actual report", self._path_row(self.actual_edit, actual_button))
+        files_form.addRow("Output folder", self._control_with_help(self.output_edit, HELP["output"]))
+
+        # ── Comparison knobs ─────────────────────────────────────────────────
+        comparison_group = QGroupBox("Comparison")
+        comp_form = QFormLayout(comparison_group)
+        comp_form.addRow("Mode", self._control_with_help(self.mode_combo, HELP["mode"]))
+        comp_form.addRow("Pixel threshold", self._control_with_help(self.threshold_spin, HELP["threshold"]))
+        comp_form.addRow("DPI", self._control_with_help(self.dpi_spin, HELP["dpi"]))
+        comp_form.addRow("Allowed diff", self._control_with_help(self.allowed_spin, HELP["allowed"]))
+
+        # ── Slide matching (with one-click presets) ──────────────────────────
+        matching_group = QGroupBox("Slide matching")
+        matching_layout = QVBoxLayout(matching_group)
+        matching_layout.addWidget(self.align_check)
+
+        profile_label = QLabel("Preset:")
+        profile_label.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
+        matching_layout.addWidget(profile_label)
+        profile_row = QHBoxLayout()
+        profile_row.setSpacing(4)
+        for button in self.profile_buttons:
+            profile_row.addWidget(button)
+        matching_layout.addLayout(profile_row)
+
+        matching_form = QFormLayout()
+        matching_form.addRow("Min matching", self._control_with_help(self.matching_spin, HELP["matching"]))
+        matching_form.addRow("Gap penalty", self._control_with_help(self.gap_penalty_spin, HELP["gap"]))
+        matching_layout.addLayout(matching_form)
+
+        # ── Display filters ──────────────────────────────────────────────────
+        display_group = QGroupBox("Display filters")
+        display_layout = QVBoxLayout(display_group)
+        display_layout.addWidget(self.show_boxes_check)
+        display_layout.addWidget(self.hide_unmatched_check)
+        display_layout.addWidget(self.only_diff_check)
+
+        # ── Action row + progress ────────────────────────────────────────────
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.run_button)
+        action_row.addWidget(self.open_output_button)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.addLayout(form)
-        left_layout.addWidget(self.only_diff_check)
-        left_layout.addWidget(self.run_button)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(files_group)
+        left_layout.addWidget(comparison_group)
+        left_layout.addWidget(matching_group)
+        left_layout.addWidget(display_group)
+        left_layout.addLayout(action_row)
         left_layout.addWidget(self.progress_bar)
+        left_layout.addWidget(self.summary_label)
         left_layout.addWidget(QLabel("Slides"))
         left_layout.addWidget(self.slide_list, 1)
 
@@ -348,6 +433,61 @@ class ReportDiffWindow(QMainWindow):
         layout.addWidget(edit, 1)
         layout.addWidget(button)
         return row
+
+    def _apply_profile(self, min_match_pct: float, gap_penalty: float) -> None:
+        """One-click profile: snap the matching knobs to a known-good combination."""
+        self.matching_spin.setValue(min_match_pct)
+        self.gap_penalty_spin.setValue(gap_penalty)
+        self.statusBar().showMessage(
+            "Matching profile: min={:.0f}%, gap={:.2f}".format(min_match_pct, gap_penalty),
+            4000,
+        )
+
+    def open_output_folder(self) -> None:
+        """Reveal the comparison's output folder in the OS file manager."""
+        if not self.output_dir:
+            return
+        path = self.output_dir
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=False)
+            else:
+                subprocess.run(["xdg-open", path], check=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot open folder", str(exc))
+
+    def _update_summary(self) -> None:
+        """Refresh the at-a-glance counters above the slide list."""
+        if not self.pixel_results and not self.object_diffs:
+            self.summary_label.setText("Run a comparison to see results.")
+            return
+
+        counts = {"matched": 0, "low_confidence_match": 0, "missing_actual": 0,
+                  "extra_actual": 0, "same_index": 0}
+        diff_pairs = 0
+        for result in self.pixel_results:
+            counts[result.match_status] = counts.get(result.match_status, 0) + 1
+            if not result.passed:
+                diff_pairs += 1
+
+        total = len(self.pixel_results)
+        good = counts["matched"] + counts["same_index"]
+        parts = ["{} pairs".format(total) if total else "0 pairs"]
+        if good:
+            parts.append("{} ✓".format(good))
+        if counts["low_confidence_match"]:
+            parts.append("{} ≈ low-conf".format(counts["low_confidence_match"]))
+        if counts["missing_actual"]:
+            parts.append("{} ⊘ missing".format(counts["missing_actual"]))
+        if counts["extra_actual"]:
+            parts.append("{} + extra".format(counts["extra_actual"]))
+        if diff_pairs:
+            parts.append("{} with pixel diffs".format(diff_pairs))
+        if self.object_diffs:
+            parts.append("{} object diffs".format(len(self.object_diffs)))
+        self.summary_label.setText("  ·  ".join(parts))
 
     def _control_with_help(self, control: QWidget, help_text: str) -> QWidget:
         row = QWidget()
@@ -426,9 +566,11 @@ class ReportDiffWindow(QMainWindow):
         self.object_diffs = list(object_diffs)
         self.output_dir = output_dir
         self.run_button.setEnabled(True)
+        self.open_output_button.setEnabled(bool(output_dir))
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("100% - Done")
         self.populate_slide_list()
+        self._update_summary()
         diff_pages = len([result for result in self.pixel_results if not result.passed])
         self.statusBar().showMessage(
             "Done. Different slides: {}. Object differences: {}. Output: {}".format(
@@ -455,12 +597,13 @@ class ReportDiffWindow(QMainWindow):
             if only_diff and result.passed:
                 continue
             score_str = "{:.0f}%".format(result.match_score * 100) if result.match_score is not None else "-"
+            icon = MATCH_STATUS_ICON.get(result.match_status, "?")
             item = QListWidgetItem(
-                "Pair {:03d} | E:{} -> A:{} | {} | sim {} | diff {:.4f}% | {} regions".format(
+                "{}  Pair {:03d}  E:{} → A:{}  ·  sim {}  ·  diff {:.4f}%  ·  {} regions".format(
+                    icon,
                     result.page,
                     result.expected_page if result.expected_page is not None else "-",
                     result.actual_page if result.actual_page is not None else "-",
-                    result.match_status,
                     score_str,
                     result.difference_percent,
                     len(result.regions),

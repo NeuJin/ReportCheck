@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -37,6 +38,15 @@ BLOCK_GRID = (8, 6)
 COLOR_BINS = 8
 WHITE_THRESHOLD = 240  # gray >= this counts as blank background, below = slide content
 EDGE_THRESHOLD = 32  # edge response above this counts as a structural edge
+
+# Tokens that vary between report versions (data values, identifiers, dates) but
+# don't change the slide's template / role. Stripping them before text matching
+# keeps the comparison focused on the boilerplate that *defines* the template.
+_VARIABLE_TOKEN_PATTERN = re.compile(
+    r"\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}"          # dates: 2026/03/25, 2025-9-17
+    r"|[A-Za-z]?\d+(?:[A-Za-z]+\d*)*"             # codes: T160, K14C, PT2, 4000rpm
+    r"|\d+(?:\.\d+)?"                              # numbers: 4000, 106.1, 24.0
+)
 
 
 @dataclass
@@ -93,7 +103,8 @@ class SlideSignature:
     edge_mask: Image.Image          # binary: structural edges (chart frames, dividers)
     block_ink: List[float]          # ink ratio in [0, 1] per grid cell
     content_color_hist: List[float]  # colour distribution over content pixels only
-    text: Optional[str]
+    text: Optional[str]             # full slide text (PPTX only)
+    title: Optional[str] = None     # title placeholder text (PPTX only)
 
 
 def parse_color(value: str) -> Tuple[int, int, int]:
@@ -451,9 +462,22 @@ def _histogram_intersection(hist_a: Sequence[float], hist_b: Sequence[float]) ->
     return sum(min(a, b) for a, b in zip(hist_a, hist_b))
 
 
+def _strip_variable_tokens(text: str) -> str:
+    """Remove data values, identifiers, and dates — the parts that change between
+    report versions while the slide template stays the same.
+
+    Two slides with the same title "解析条件 - 燃焼圧" but different rpm values
+    (4000/5500/6000 vs 6000) should read as nearly-identical text after this
+    pass; their template tokens (解析条件, 燃焼圧, 筒内圧, クランク角, 仕様, …)
+    remain intact.
+    """
+    return _VARIABLE_TOKEN_PATTERN.sub(" ", text)
+
+
 def _char_bigrams(text: str) -> set:
-    """Character bigrams — works for CJK text where whitespace tokenizing fails."""
-    compact = "".join(text.split()).lower()
+    """Character bigrams over the slide's template tokens — works for CJK text
+    where whitespace tokenizing fails, and ignores variable data values."""
+    compact = "".join(_strip_variable_tokens(text).split()).lower()
     if len(compact) < 2:
         return {compact} if compact else set()
     return {compact[index:index + 2] for index in range(len(compact) - 1)}
@@ -471,7 +495,11 @@ def text_similarity(text_a: str, text_b: str) -> float:
     return len(bigrams_a & bigrams_b) / union if union else 0.0
 
 
-def compute_signature(image: Image.Image, text: Optional[str] = None) -> SlideSignature:
+def compute_signature(
+    image: Image.Image,
+    text: Optional[str] = None,
+    title: Optional[str] = None,
+) -> SlideSignature:
     """Pre-compute every per-slide feature once so alignment can reuse them.
 
     align_slide_pages compares every expected slide against every actual slide
@@ -484,22 +512,30 @@ def compute_signature(image: Image.Image, text: Optional[str] = None) -> SlideSi
         block_ink=_block_ink_ratios(image),
         content_color_hist=_content_color_histogram(image),
         text=text,
+        title=title,
     )
 
 
 def signature_similarity(expected: SlideSignature, actual: SlideSignature) -> float:
     """Composite similarity in [0, 1] from all available per-slide signals.
 
-    Every component looks at *content*, never at the shared white background,
-    so the score reflects how alike the slides actually are:
+    Every visual component looks at *content*, never at the shared white
+    background, so the score reflects how alike the slides actually are:
       40% layout — IoU of content masks (is the content in the same places?)
       25% blocks — per-cell ink ratio (how is content distributed?)
       20% edges  — IoU of structural edges (chart frames, dividers, tables)
       15% colour — colour distribution over content pixels
 
-    When both slides carry text (PPTX inputs) it is the strongest signal there
-    is — a shared title almost always means a real match — so the final score
-    becomes 55% visual + 45% text.
+    The mix with text depends on whether titles are available:
+
+    - When **both** slides expose a title (PPTX title placeholder), the title is
+      the strongest template signal in technical reports — two slides titled
+      "解析条件 - 燃焼圧" almost certainly play the same role even if their data
+      tables differ in row count. If those titles match strongly the visual is
+      mostly a tie-breaker; otherwise the four signals (visual + title + body +
+      a soft body match) blend.
+    - When only full text is available, fall back to a balanced visual/text mix.
+    - With no text at all (images, PPT) the visual score stands on its own.
     """
     layout_sim = _mask_iou(expected.content_mask, actual.content_mask)
     block_sim = _block_ink_similarity(expected.block_ink, actual.block_ink)
@@ -507,7 +543,24 @@ def signature_similarity(expected: SlideSignature, actual: SlideSignature) -> fl
     color_sim = _histogram_intersection(expected.content_color_hist, actual.content_color_hist)
     visual = 0.40 * layout_sim + 0.25 * block_sim + 0.20 * edge_sim + 0.15 * color_sim
 
-    if expected.text is not None and actual.text is not None:
+    has_title = bool(expected.title) and bool(actual.title)
+    has_text = expected.text is not None and actual.text is not None
+
+    if has_title:
+        title_sim = text_similarity(expected.title or "", actual.title or "")
+        body_sim = text_similarity(expected.text or "", actual.text or "") if has_text else title_sim
+        text_score = 0.70 * title_sim + 0.30 * body_sim
+        if title_sim >= 0.85:
+            # Titles are essentially identical → strong template match. Trust the
+            # text signal; visual is just a tie-breaker against false positives.
+            return 0.15 * visual + 0.85 * text_score
+        if title_sim >= 0.55:
+            # Related titles — meaningful template overlap.
+            return 0.35 * visual + 0.65 * text_score
+        # Title mismatch but body might still help; treat like plain text mode.
+        return 0.55 * visual + 0.45 * text_score
+
+    if has_text:
         return 0.55 * visual + 0.45 * text_similarity(expected.text, actual.text)
     return visual
 
@@ -643,6 +696,16 @@ def _maybe_load_slide_texts(path: Path) -> Optional[List[str]]:
         return None
 
 
+def _maybe_load_slide_titles(path: Path) -> Optional[List[str]]:
+    """Per-slide title text for PPTX inputs; None when not available."""
+    if path.suffix.lower() != PPTX_EXT:
+        return None
+    try:
+        return extract_slide_titles(path)
+    except Exception:
+        return None
+
+
 def write_similarity_matrix(
     output_dir: Path,
     scores: Sequence[Sequence[float]],
@@ -722,16 +785,20 @@ def compare_pixels(
     if align_slides:
         expected_texts = _maybe_load_slide_texts(expected_path)
         actual_texts = _maybe_load_slide_texts(actual_path)
-        # Text is only a usable matching signal when *both* reports expose it.
+        expected_titles = _maybe_load_slide_titles(expected_path)
+        actual_titles = _maybe_load_slide_titles(actual_path)
+        # Text/title are only usable matching signals when *both* reports expose them.
         if expected_texts is None or actual_texts is None:
             expected_texts = actual_texts = None
+        if expected_titles is None or actual_titles is None:
+            expected_titles = actual_titles = None
 
         expected_sigs = [
-            compute_signature(page, _text_at(expected_texts, i))
+            compute_signature(page, _text_at(expected_texts, i), _text_at(expected_titles, i))
             for i, page in enumerate(expected_pages)
         ]
         actual_sigs = [
-            compute_signature(page, _text_at(actual_texts, j))
+            compute_signature(page, _text_at(actual_texts, j), _text_at(actual_titles, j))
             for j, page in enumerate(actual_pages)
         ]
         scores = build_score_matrix(expected_sigs, actual_sigs)
@@ -830,6 +897,49 @@ def extract_slide_texts(path: Path) -> List[str]:
     ]
 
 
+def extract_slide_titles(path: Path) -> List[str]:
+    """Per-slide title text — the strongest template signal for technical reports.
+
+    Uses the PPTX title placeholder when present; otherwise falls back to the
+    topmost meaningfully-long text shape on the slide.  Two slides labelled
+    "解析条件 - 燃焼圧" (with different test cases below) match almost perfectly
+    on title alone, which is exactly the kind of cross-version pairing the body
+    text — with its differing values — would muddy.
+    """
+    try:
+        from pptx import Presentation  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "Title extraction requires python-pptx. Install it with: pip install python-pptx"
+        ) from exc
+
+    titles: List[str] = []
+    presentation = Presentation(str(path))
+    for slide in presentation.slides:
+        title = ""
+        title_shape = getattr(slide.shapes, "title", None)
+        if title_shape is not None and getattr(title_shape, "has_text_frame", False):
+            title = (title_shape.text_frame.text or "").strip()
+
+        if not title:
+            # Fallback: topmost text shape with at least 4 characters — skips
+            # short page numbers and "Confidential" stamps at the corner.
+            candidates = []
+            for shape in slide.shapes:
+                if not getattr(shape, "has_text_frame", False):
+                    continue
+                text = (shape.text_frame.text or "").strip()
+                if len(text) < 4:
+                    continue
+                top = getattr(shape, "top", 0) or 0
+                candidates.append((top, text))
+            if candidates:
+                title = min(candidates, key=lambda candidate: candidate[0])[1]
+
+        titles.append(title)
+    return titles
+
+
 def align_pptx_by_text(
     expected_path: Path,
     actual_path: Path,
@@ -837,19 +947,39 @@ def align_pptx_by_text(
     gap_penalty: float = DEFAULT_GAP_PENALTY,
     output_dir: Optional[Path] = None,
 ) -> List[SlideMatch]:
-    """Align two PPTX files using text similarity only — no slide rendering.
+    """Align two PPTX files using title + body text similarity (no rendering).
 
     For object-only comparisons we have no pixel signatures to work with, but
-    PPTX gives us the actual text per slide, which is usually a stronger signal
-    than visual matching anyway.  If ``output_dir`` is given, the score matrix
-    is exported for audit just like the visual path.
+    PPTX gives us per-slide titles and full body text — usually a stronger
+    matching signal than the visual path anyway.  Title bigram Jaccard
+    dominates; the body provides a soft tie-breaker.  If ``output_dir`` is
+    given, the score matrix is exported for audit just like the visual path.
     """
     expected_texts = extract_slide_texts(expected_path)
     actual_texts = extract_slide_texts(actual_path)
+    try:
+        expected_titles = extract_slide_titles(expected_path)
+        actual_titles = extract_slide_titles(actual_path)
+    except Exception:
+        expected_titles = ["" for _ in expected_texts]
+        actual_titles = ["" for _ in actual_texts]
+
+    def pair_score(i: int, j: int) -> float:
+        title_sim = text_similarity(
+            _text_at(expected_titles, i) or "",
+            _text_at(actual_titles, j) or "",
+        )
+        body_sim = text_similarity(expected_texts[i], actual_texts[j])
+        if title_sim >= 0.85:
+            return 0.85 * (0.70 * title_sim + 0.30 * body_sim) + 0.15 * body_sim
+        if title_sim >= 0.55:
+            return 0.65 * (0.70 * title_sim + 0.30 * body_sim) + 0.35 * body_sim
+        return 0.45 * title_sim + 0.55 * body_sim
+
     expected_count = len(expected_texts)
     actual_count = len(actual_texts)
     scores = [
-        [text_similarity(expected_texts[i], actual_texts[j]) for j in range(actual_count)]
+        [pair_score(i, j) for j in range(actual_count)]
         for i in range(expected_count)
     ]
     matches = align_from_score_matrix(
