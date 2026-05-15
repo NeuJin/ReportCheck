@@ -107,8 +107,6 @@ class ImagePreview(QScrollArea):
     def set_result(self, result, show_boxes: bool) -> None:
         self._result = result
         self._show_boxes = show_boxes
-        image_path = result.output_overlay if show_boxes else result.output_actual
-        self.set_image(image_path)
 
     def set_image(self, image_path: str) -> None:
         pixmap = QPixmap(image_path)
@@ -236,6 +234,17 @@ class ReportDiffWindow(QMainWindow):
         self.show_boxes_check.setToolTip(HELP["boxes"])
         self.show_boxes_check.stateChanged.connect(self.refresh_current_preview)
 
+        self.view_overlay_button = QPushButton("Overlay")
+        self.view_expected_button = QPushButton("Expected")
+        self.view_actual_button = QPushButton("Actual")
+        self.view_overlay_button.setToolTip("Show actual report with red highlight boxes")
+        self.view_expected_button.setToolTip("Show original expected/old slide image")
+        self.view_actual_button.setToolTip("Show original actual/new slide image without highlight boxes")
+        self.view_overlay_button.clicked.connect(lambda: self.set_preview_mode("overlay"))
+        self.view_expected_button.clicked.connect(lambda: self.set_preview_mode("expected"))
+        self.view_actual_button.clicked.connect(lambda: self.set_preview_mode("actual"))
+        self.preview_mode = "overlay"
+
         self.only_diff_check = QCheckBox("Only different slides")
         self.only_diff_check.setChecked(True)
         self.only_diff_check.stateChanged.connect(self.populate_slide_list)
@@ -289,6 +298,13 @@ class ReportDiffWindow(QMainWindow):
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        preview_toolbar = QHBoxLayout()
+        preview_toolbar.addWidget(QLabel("View"))
+        preview_toolbar.addWidget(self.view_overlay_button)
+        preview_toolbar.addWidget(self.view_expected_button)
+        preview_toolbar.addWidget(self.view_actual_button)
+        preview_toolbar.addStretch(1)
+        right_layout.addLayout(preview_toolbar)
         right_layout.addWidget(self.preview, 4)
         right_layout.addWidget(QLabel("Details"))
         right_layout.addWidget(self.detail_box, 1)
@@ -429,16 +445,30 @@ class ReportDiffWindow(QMainWindow):
             self.preview._pixmap = None
             self.detail_box.setPlainText(self.object_diff_text())
 
+    def set_preview_mode(self, mode: str) -> None:
+        self.preview_mode = mode
+        self.refresh_current_preview()
+
     def refresh_current_preview(self) -> None:
         current = self.slide_list.currentItem()
         if current is not None:
             self.slide_selected(current, None)
+
+    def image_path_for_mode(self, result) -> str:
+        if self.preview_mode == "expected":
+            return result.output_expected
+        if self.preview_mode == "actual":
+            return result.output_actual
+        if self.show_boxes_check.isChecked():
+            return result.output_overlay
+        return result.output_actual
 
     def slide_selected(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
         if current is None:
             return
         result = current.data(Qt.UserRole)
         self.preview.set_result(result, self.show_boxes_check.isChecked())
+        self.preview.set_image(self.image_path_for_mode(result))
         details = [
             "Pair: {}".format(result.page),
             "Expected page: {}".format(result.expected_page if result.expected_page is not None else "-"),
@@ -450,8 +480,9 @@ class ReportDiffWindow(QMainWindow):
             "Max channel delta: {}".format(result.max_channel_delta),
             "Bounding box: {}".format(result.bbox),
             "Highlight regions: {}".format(len(result.regions)),
+            "Expected original: {}".format(result.output_expected),
+            "Actual original: {}".format(result.output_actual),
             "Overlay: {}".format(result.output_overlay),
-            "Actual clean: {}".format(result.output_actual),
             "Mask: {}".format(result.output_mask),
             "",
             self.object_diff_text(result.expected_page),
