@@ -642,6 +642,174 @@ def align_from_score_matrix(
     return matches
 
 
+def load_match_overrides(path: Path) -> Dict[int, Optional[int]]:
+    """Load a manual ``{expected_slide: actual_slide}`` mapping from JSON.
+
+    The JSON uses 1-based slide numbers (what the user sees in the GUI/output);
+    this function returns a dict keyed by 0-based expected index → 0-based
+    actual index, or ``None`` to force "missing" for that expected slide.
+
+    Example file::
+
+        {
+          "1": 2,
+          "3": null,
+          "5": 5
+        }
+
+    Means: expected slide 1 pairs with actual slide 2; expected slide 3 has no
+    counterpart in the actual report; expected slide 5 stays paired with actual
+    slide 5. Slides not listed fall back to whatever automatic alignment found.
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "Match overrides JSON must be a mapping {expected_slide: actual_slide}; "
+            "got {}".format(type(raw).__name__)
+        )
+
+    overrides: Dict[int, Optional[int]] = {}
+    for key, value in raw.items():
+        try:
+            expected_idx = int(key) - 1
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Override key {!r} is not a slide number".format(key)
+            ) from exc
+        if expected_idx < 0:
+            raise ValueError(
+                "Override slide numbers are 1-based; key {!r} is not valid".format(key)
+            )
+        if value is None:
+            overrides[expected_idx] = None
+            continue
+        try:
+            actual_idx = int(value) - 1
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Override value for slide {} must be a slide number or null; "
+                "got {!r}".format(key, value)
+            ) from exc
+        if actual_idx < 0:
+            raise ValueError(
+                "Override slide numbers are 1-based; value {!r} is not valid".format(value)
+            )
+        overrides[expected_idx] = actual_idx
+    return overrides
+
+
+def apply_match_overrides(
+    matches: Sequence[SlideMatch],
+    overrides: Dict[int, Optional[int]],
+    expected_count: int,
+    actual_count: int,
+) -> List[SlideMatch]:
+    """Patch an automatic alignment with manual user-supplied pairings.
+
+    Manual mappings always win: any auto-match that touched the same expected
+    or actual slide is dropped, the manual pair is inserted with status
+    ``"manual_match"``, and any slide that lost its pair as a result is
+    demoted to missing/extra. Slides not mentioned in the overrides keep
+    their auto-match.
+    """
+    if not overrides:
+        return list(matches)
+
+    expected_taken: set = set()
+    actual_taken: set = set()
+    for expected_idx, actual_idx in overrides.items():
+        if expected_idx >= expected_count:
+            raise ValueError(
+                "Override expected slide {} is out of range (1..{})".format(
+                    expected_idx + 1, expected_count
+                )
+            )
+        if expected_idx in expected_taken:
+            raise ValueError(
+                "Duplicate override for expected slide {}".format(expected_idx + 1)
+            )
+        expected_taken.add(expected_idx)
+        if actual_idx is None:
+            continue
+        if actual_idx >= actual_count:
+            raise ValueError(
+                "Override actual slide {} is out of range (1..{})".format(
+                    actual_idx + 1, actual_count
+                )
+            )
+        if actual_idx in actual_taken:
+            raise ValueError(
+                "Override maps multiple expected slides to actual slide {}".format(
+                    actual_idx + 1
+                )
+            )
+        actual_taken.add(actual_idx)
+
+    new_matches: List[SlideMatch] = []
+    expected_seen: set = set()
+    actual_seen: set = set()
+
+    for expected_idx in sorted(overrides.keys()):
+        actual_idx = overrides[expected_idx]
+        if actual_idx is None:
+            new_matches.append(SlideMatch(expected_idx, None, None, "missing_actual"))
+        else:
+            new_matches.append(SlideMatch(expected_idx, actual_idx, 1.0, "manual_match"))
+            actual_seen.add(actual_idx)
+        expected_seen.add(expected_idx)
+
+    for match in matches:
+        e = match.expected_index
+        a = match.actual_index
+        if e is not None and e in expected_seen:
+            continue
+        if a is not None and a in actual_seen:
+            continue
+        new_matches.append(match)
+        if e is not None:
+            expected_seen.add(e)
+        if a is not None:
+            actual_seen.add(a)
+
+    for expected_idx in range(expected_count):
+        if expected_idx not in expected_seen:
+            new_matches.append(SlideMatch(expected_idx, None, None, "missing_actual"))
+    for actual_idx in range(actual_count):
+        if actual_idx not in actual_seen:
+            new_matches.append(SlideMatch(None, actual_idx, None, "extra_actual"))
+
+    def sort_key(m: SlideMatch) -> Tuple[int, int, int]:
+        # Order: rows with expected first (by expected idx), then extras (by actual idx).
+        if m.expected_index is not None:
+            return (0, m.expected_index, m.actual_index if m.actual_index is not None else -1)
+        return (1, m.actual_index if m.actual_index is not None else 0, 0)
+
+    new_matches.sort(key=sort_key)
+    return new_matches
+
+
+def export_overrides_template(matches: Sequence[SlideMatch], path: Path) -> None:
+    """Write the current alignment as a starting overrides JSON.
+
+    Saves only the pairs that have both an expected and an actual slide (plus
+    forced-missing expected slides as ``null``). Users edit this file by hand
+    to fix any mismatches, then feed it back via ``--match-overrides``.
+    """
+    overrides: Dict[str, Optional[int]] = {}
+    for match in matches:
+        if match.expected_index is None:
+            continue  # extras can't be expressed in this format (no expected key)
+        key = str(match.expected_index + 1)
+        if match.actual_index is None:
+            overrides[key] = None
+        else:
+            overrides[key] = match.actual_index + 1
+    path.write_text(
+        json.dumps(overrides, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def align_slide_pages(
     expected_pages: Sequence[Image.Image],
     actual_pages: Sequence[Image.Image],
@@ -704,6 +872,20 @@ def _maybe_load_slide_titles(path: Path) -> Optional[List[str]]:
         return extract_slide_titles(path)
     except Exception:
         return None
+
+
+def _apply_overrides_from_args(
+    args: argparse.Namespace,
+    matches: Sequence[SlideMatch],
+    expected_count: int,
+    actual_count: int,
+) -> List[SlideMatch]:
+    """If the user supplied --match-overrides, load and apply them; else pass through."""
+    overrides_path = getattr(args, "match_overrides", None)
+    if not overrides_path:
+        return list(matches)
+    overrides = load_match_overrides(Path(overrides_path))
+    return apply_match_overrides(matches, overrides, expected_count, actual_count)
 
 
 def write_similarity_matrix(
@@ -805,11 +987,17 @@ def compare_pixels(
         matches = align_from_score_matrix(
             scores, len(expected_pages), len(actual_pages), min_match_score, gap_penalty
         )
+        matches = _apply_overrides_from_args(
+            args, matches, len(expected_pages), len(actual_pages)
+        )
         write_similarity_matrix(
             output_dir, scores, matches, min_match_score, text_used=expected_texts is not None
         )
     else:
         matches = index_slide_pages(expected_pages, actual_pages)
+        matches = _apply_overrides_from_args(
+            args, matches, len(expected_pages), len(actual_pages)
+        )
 
     results = []
     blank = Image.new("RGB", (1, 1), (255, 255, 255))
@@ -1023,6 +1211,9 @@ def compare_objects(
             )
         else:
             matches = index_slide_pages(expected_slides, actual_slides)
+        matches = _apply_overrides_from_args(
+            args, matches, len(expected_slides), len(actual_slides)
+        )
 
     diffs: List[ObjectDiff] = []
     for pair_index, match in enumerate(matches, start=1):
@@ -1203,6 +1394,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_GAP_PENALTY,
         help="Cost of leaving a slide unmatched during auto alignment; a more "
         "negative value makes the matcher less willing to pair dissimilar slides",
+    )
+    parser.add_argument(
+        "--match-overrides",
+        type=str,
+        default=None,
+        help='Path to a JSON file forcing specific slide pairings, e.g. '
+        '{"1": 2, "3": null} pairs expected slide 1 with actual slide 2 and '
+        'forces expected slide 3 to "missing". Listed slides override auto-match; '
+        'unlisted slides keep their automatic pairing.',
     )
     parser.add_argument(
         "-t",

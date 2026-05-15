@@ -3,30 +3,39 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import traceback
+from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Dict, Optional
 
 from PySide2.QtCore import QObject, QSize, Qt, QThread, Signal, QEvent
-from PySide2.QtGui import QBrush, QColor, QPixmap
+from PySide2.QtGui import QBrush, QColor, QIcon, QPixmap
 from PySide2.QtWidgets import (
+    QAction,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -35,6 +44,7 @@ from PySide2.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QTextEdit,
     QToolTip,
     QVBoxLayout,
@@ -64,6 +74,7 @@ MATCH_STATUS_ICON = {
     "missing_actual": "⊘",
     "extra_actual": "+",
     "same_index": "·",
+    "manual_match": "M",
 }
 
 
@@ -75,6 +86,10 @@ HELP = {
     "align": "Match slides by visual similarity before diff. Use when report page counts or order differ.",
     "matching": "Minimum similarity percentage for auto matching. 82% is practical; raise if wrong slides match, lower if related slides do not match.",
     "gap": "Penalty for leaving a slide unmatched during auto align. More negative = matcher pairs slides only when clearly similar; less negative = more eager to pair. -0.12 is the default.",
+    "overrides": ('JSON file forcing specific slide pairings, e.g. {"1": 2, "3": null} '
+                  'pairs expected slide 1 with actual slide 2 and forces expected slide 3 '
+                  'to "missing". Use "Export current as template" after a run to get a '
+                  'starting file that you can edit by hand.'),
     "boxes": "Show or hide red highlight rectangles. Very large regions use lighter fill. Hover a visible rectangle to see its bbox/size.",
     "unmatched": "Hide pairs where one side has no matching slide, such as extra_actual or missing_actual.",
     "output": "Relative output folder inside this downloaded package only.",
@@ -117,6 +132,50 @@ class CompareWorker(QObject):
             self.failed.emit(traceback.format_exc())
 
 
+_PIXMAP_CACHE: "OrderedDict[str, QPixmap]" = OrderedDict()
+_PIXMAP_CACHE_LIMIT = 60
+
+_THUMB_CACHE: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+_THUMB_CACHE_LIMIT = 200
+
+
+def _load_pixmap_cached(image_path: str) -> Optional[QPixmap]:
+    """LRU-cached QPixmap.
+
+    Slide navigation re-opens the same PNGs repeatedly; loading a 1-2 MB image
+    from disk + decoding takes long enough to feel sluggish. Caching the
+    decoded QPixmap makes every re-visit instant.
+    """
+    cached = _PIXMAP_CACHE.get(image_path)
+    if cached is not None:
+        _PIXMAP_CACHE.move_to_end(image_path)
+        return cached
+    pixmap = QPixmap(image_path)
+    if pixmap.isNull():
+        return None
+    _PIXMAP_CACHE[image_path] = pixmap
+    if len(_PIXMAP_CACHE) > _PIXMAP_CACHE_LIMIT:
+        _PIXMAP_CACHE.popitem(last=False)
+    return pixmap
+
+
+def _load_thumbnail_cached(image_path: str, size: QSize) -> Optional[QPixmap]:
+    """LRU-cached scaled thumbnail keyed by path + target size."""
+    key = (image_path, size.width(), size.height())
+    cached = _THUMB_CACHE.get(key)
+    if cached is not None:
+        _THUMB_CACHE.move_to_end(key)
+        return cached
+    full = _load_pixmap_cached(image_path)
+    if full is None:
+        return None
+    thumb = full.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    _THUMB_CACHE[key] = thumb
+    if len(_THUMB_CACHE) > _THUMB_CACHE_LIMIT:
+        _THUMB_CACHE.popitem(last=False)
+    return thumb
+
+
 class ImagePreview(QScrollArea):
     def __init__(self):
         super().__init__()
@@ -133,19 +192,25 @@ class ImagePreview(QScrollArea):
         self._scaled: Optional[QPixmap] = None
         self._result = None
         self._show_boxes = True
+        self._last_image_path: Optional[str] = None
 
     def set_result(self, result, show_boxes: bool) -> None:
         self._result = result
         self._show_boxes = show_boxes
 
     def set_image(self, image_path: str) -> None:
-        pixmap = QPixmap(image_path)
-        if pixmap.isNull():
+        # Skip work if we're already showing this exact image.
+        if image_path == self._last_image_path and self._pixmap is not None:
+            return
+        pixmap = _load_pixmap_cached(image_path)
+        if pixmap is None:
             self._pixmap = None
             self._scaled = None
+            self._last_image_path = None
             self.label.setText("Cannot load image")
             return
         self._pixmap = pixmap
+        self._last_image_path = image_path
         self._fit_pixmap()
 
     def resizeEvent(self, event):  # type: ignore[override]
@@ -274,6 +339,19 @@ class ReportDiffWindow(QMainWindow):
         self.gap_penalty_spin.setValue(engine.DEFAULT_GAP_PENALTY)
         self.gap_penalty_spin.setToolTip(HELP["gap"])
 
+        self.overrides_edit = QLineEdit()
+        self.overrides_edit.setPlaceholderText("optional — JSON file with manual slide pairings")
+        self.overrides_edit.setToolTip(HELP["overrides"])
+        self.overrides_browse_button = QPushButton("Browse")
+        self.overrides_browse_button.clicked.connect(self.pick_overrides_file)
+        self.export_overrides_button = QPushButton("Export current as template")
+        self.export_overrides_button.setEnabled(False)
+        self.export_overrides_button.setToolTip(
+            "Save the alignment from the latest run as a JSON template you can "
+            "edit by hand to override specific pairings."
+        )
+        self.export_overrides_button.clicked.connect(self.export_current_overrides)
+
         self.show_boxes_check = QCheckBox("Show highlight boxes")
         self.show_boxes_check.setChecked(True)
         self.show_boxes_check.setToolTip(HELP["boxes"])
@@ -329,8 +407,38 @@ class ReportDiffWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Ready")
 
+        # Slide-navigator: three tabs sharing a panel.
+        #   Pairs    — comparison pairs (with status icons + manual overrides)
+        #   Expected — every slide in the expected file, like PowerPoint's strip
+        #   Actual   — every slide in the actual file
+        # Tracked in memory between runs so the user can flip back-and-forth.
+        thumb_icon_size = QSize(120, 68)
+
         self.slide_list = QListWidget()
+        self.slide_list.setIconSize(thumb_icon_size)
+        self.slide_list.setSpacing(2)
+        self.slide_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.slide_list.customContextMenuRequested.connect(self._show_pair_context_menu)
         self.slide_list.currentItemChanged.connect(self.slide_selected)
+
+        self.expected_list = QListWidget()
+        self.expected_list.setIconSize(thumb_icon_size)
+        self.expected_list.setSpacing(2)
+        self.expected_list.currentItemChanged.connect(self._expected_selected)
+
+        self.actual_list = QListWidget()
+        self.actual_list.setIconSize(thumb_icon_size)
+        self.actual_list.setSpacing(2)
+        self.actual_list.currentItemChanged.connect(self._actual_selected)
+
+        self.slide_tabs = QTabWidget()
+        self.slide_tabs.addTab(self.slide_list, "Pairs")
+        self.slide_tabs.addTab(self.expected_list, "Expected slides")
+        self.slide_tabs.addTab(self.actual_list, "Actual slides")
+
+        # In-memory manual overrides: 0-based expected idx → 0-based actual idx
+        # (or None for forced-missing). Persisted across runs within the session.
+        self.manual_overrides: Dict[int, Optional[int]] = {}
 
         self.preview = ImagePreview()
         self.detail_box = QTextEdit()
@@ -379,7 +487,12 @@ class ReportDiffWindow(QMainWindow):
         matching_form = QFormLayout()
         matching_form.addRow("Min matching", self._control_with_help(self.matching_spin, HELP["matching"]))
         matching_form.addRow("Gap penalty", self._control_with_help(self.gap_penalty_spin, HELP["gap"]))
+        matching_form.addRow(
+            "Manual overrides",
+            self._path_row(self.overrides_edit, self.overrides_browse_button),
+        )
         matching_layout.addLayout(matching_form)
+        matching_layout.addWidget(self.export_overrides_button)
 
         # ── Display filters ──────────────────────────────────────────────────
         display_group = QGroupBox("Display filters")
@@ -403,8 +516,7 @@ class ReportDiffWindow(QMainWindow):
         left_layout.addLayout(action_row)
         left_layout.addWidget(self.progress_bar)
         left_layout.addWidget(self.summary_label)
-        left_layout.addWidget(QLabel("Slides"))
-        left_layout.addWidget(self.slide_list, 1)
+        left_layout.addWidget(self.slide_tabs, 1)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -443,6 +555,241 @@ class ReportDiffWindow(QMainWindow):
             4000,
         )
 
+    def _populate_original_file_lists(self) -> None:
+        """Fill the Expected / Actual tabs with one row per slide from each file.
+
+        Lets the user browse a report end-to-end (PowerPoint-strip style),
+        independent of which slides happened to pair up.
+        """
+        self.expected_list.blockSignals(True)
+        self.actual_list.blockSignals(True)
+        self.expected_list.clear()
+        self.actual_list.clear()
+
+        # Pull unique (slide_number → image_path) pairs from the per-pair results.
+        expected_slides: Dict[int, str] = {}
+        actual_slides: Dict[int, str] = {}
+        for result in self.pixel_results:
+            if result.expected_page is not None and result.output_expected:
+                expected_slides.setdefault(result.expected_page, result.output_expected)
+            if result.actual_page is not None and result.output_actual:
+                actual_slides.setdefault(result.actual_page, result.output_actual)
+
+        icon_size = self.expected_list.iconSize()
+        for slide_no, image_path in sorted(expected_slides.items()):
+            item = QListWidgetItem("Slide {:03d}".format(slide_no))
+            thumb = _load_thumbnail_cached(image_path, icon_size)
+            if thumb is not None:
+                item.setIcon(QIcon(thumb))
+            item.setData(Qt.UserRole, (slide_no, image_path))
+            self.expected_list.addItem(item)
+
+        for slide_no, image_path in sorted(actual_slides.items()):
+            item = QListWidgetItem("Slide {:03d}".format(slide_no))
+            thumb = _load_thumbnail_cached(image_path, icon_size)
+            if thumb is not None:
+                item.setIcon(QIcon(thumb))
+            item.setData(Qt.UserRole, (slide_no, image_path))
+            self.actual_list.addItem(item)
+
+        self.expected_list.blockSignals(False)
+        self.actual_list.blockSignals(False)
+
+    def _expected_selected(self, current, _previous) -> None:
+        self._show_standalone_slide(current, side="Expected")
+
+    def _actual_selected(self, current, _previous) -> None:
+        self._show_standalone_slide(current, side="Actual")
+
+    def _show_standalone_slide(self, item: Optional[QListWidgetItem], side: str) -> None:
+        if item is None:
+            return
+        data = item.data(Qt.UserRole)
+        if data is None:
+            return
+        slide_no, image_path = data
+        # Drop overlay-region metadata so tooltip code stays quiet on plain views.
+        self.preview.set_result(None, False)
+        self.preview.set_image(image_path)
+        self.detail_box.setPlainText(
+            "{} report — slide {}\n\nFile: {}".format(side, slide_no, image_path)
+        )
+
+    # ── Manual overrides via right-click ──────────────────────────────────
+
+    def _show_pair_context_menu(self, position) -> None:
+        item = self.slide_list.itemAt(position)
+        if item is None:
+            return
+        result = item.data(Qt.UserRole)
+        if result is None:
+            return
+
+        menu = QMenu(self)
+        if result.expected_page is not None:
+            menu.addAction(
+                "Force pair with actual slide…",
+                lambda: self._force_pair_with_actual(result),
+            )
+            menu.addAction(
+                "Force missing (no actual pair)",
+                lambda: self._force_missing(result),
+            )
+            menu.addAction(
+                "Reset this pair to auto match",
+                lambda: self._reset_override(result),
+            )
+        else:
+            menu.addAction(
+                "Pair this actual slide with expected slide…",
+                lambda: self._force_pair_with_expected(result),
+            )
+        menu.addSeparator()
+        menu.addAction("Clear all manual overrides", self._clear_all_overrides)
+        menu.exec_(self.slide_list.viewport().mapToGlobal(position))
+
+    def _available_actual_slides(self) -> "list[int]":
+        seen = set()
+        for result in self.pixel_results:
+            if result.actual_page is not None:
+                seen.add(result.actual_page)
+        return sorted(seen)
+
+    def _available_expected_slides(self) -> "list[int]":
+        seen = set()
+        for result in self.pixel_results:
+            if result.expected_page is not None:
+                seen.add(result.expected_page)
+        return sorted(seen)
+
+    def _force_pair_with_actual(self, result) -> None:
+        actuals = self._available_actual_slides()
+        if not actuals:
+            return
+        current = result.actual_page if result.actual_page is not None else actuals[0]
+        choice, ok = QInputDialog.getInt(
+            self,
+            "Force pair",
+            "Pair expected slide {} with actual slide:".format(result.expected_page),
+            current,
+            min(actuals),
+            max(actuals),
+            1,
+        )
+        if not ok:
+            return
+        self.manual_overrides[result.expected_page - 1] = choice - 1
+        self._mark_overrides_pending()
+
+    def _force_pair_with_expected(self, result) -> None:
+        expecteds = self._available_expected_slides()
+        if not expecteds or result.actual_page is None:
+            return
+        choice, ok = QInputDialog.getInt(
+            self,
+            "Pair with expected",
+            "Pair expected slide ? with actual slide {}:".format(result.actual_page),
+            expecteds[0],
+            min(expecteds),
+            max(expecteds),
+            1,
+        )
+        if not ok:
+            return
+        self.manual_overrides[choice - 1] = result.actual_page - 1
+        self._mark_overrides_pending()
+
+    def _force_missing(self, result) -> None:
+        self.manual_overrides[result.expected_page - 1] = None
+        self._mark_overrides_pending()
+
+    def _reset_override(self, result) -> None:
+        key = result.expected_page - 1
+        if key in self.manual_overrides:
+            del self.manual_overrides[key]
+            self._mark_overrides_pending()
+
+    def _clear_all_overrides(self) -> None:
+        if not self.manual_overrides:
+            return
+        self.manual_overrides.clear()
+        self.overrides_edit.clear()
+        self.statusBar().showMessage("All manual overrides cleared.", 4000)
+
+    def _mark_overrides_pending(self) -> None:
+        """Persist current in-memory overrides to a temp JSON and surface a hint.
+
+        The next Run uses this file via the existing --match-overrides plumbing,
+        so GUI and CLI take exactly the same path through the engine.
+        """
+        if not self.manual_overrides:
+            self.overrides_edit.clear()
+            return
+        overrides_json = {
+            str(key + 1): (None if value is None else value + 1)
+            for key, value in self.manual_overrides.items()
+        }
+        temp_path = Path(tempfile.gettempdir()) / "report_diff_overrides_pending.json"
+        try:
+            temp_path.write_text(
+                json.dumps(overrides_json, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot stage overrides", str(exc))
+            return
+        self.overrides_edit.setText(str(temp_path))
+        self.statusBar().showMessage(
+            "{} manual override(s) staged — click Run compare to apply.".format(
+                len(self.manual_overrides)
+            ),
+            6000,
+        )
+
+    def pick_overrides_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select match-overrides JSON",
+            self.overrides_edit.text().strip() or "",
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if path:
+            self.overrides_edit.setText(path)
+
+    def export_current_overrides(self) -> None:
+        if not self.pixel_results:
+            QMessageBox.information(
+                self,
+                "Nothing to export",
+                "Run a comparison first — the current alignment is exported as a "
+                "starting template.",
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save overrides template",
+            "match_overrides.json",
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            # Reconstruct SlideMatch list from PageDiff results so the engine can serialize it.
+            matches = [
+                engine.SlideMatch(
+                    expected_index=(result.expected_page - 1) if result.expected_page is not None else None,
+                    actual_index=(result.actual_page - 1) if result.actual_page is not None else None,
+                    score=result.match_score,
+                    status=result.match_status,
+                )
+                for result in self.pixel_results
+            ]
+            engine.export_overrides_template(matches, __import__("pathlib").Path(path))
+            self.overrides_edit.setText(path)
+            self.statusBar().showMessage("Overrides template saved: {}".format(path), 6000)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+
     def open_output_folder(self) -> None:
         """Reveal the comparison's output folder in the OS file manager."""
         if not self.output_dir:
@@ -465,7 +812,7 @@ class ReportDiffWindow(QMainWindow):
             return
 
         counts = {"matched": 0, "low_confidence_match": 0, "missing_actual": 0,
-                  "extra_actual": 0, "same_index": 0}
+                  "extra_actual": 0, "same_index": 0, "manual_match": 0}
         diff_pairs = 0
         for result in self.pixel_results:
             counts[result.match_status] = counts.get(result.match_status, 0) + 1
@@ -477,6 +824,8 @@ class ReportDiffWindow(QMainWindow):
         parts = ["{} pairs".format(total) if total else "0 pairs"]
         if good:
             parts.append("{} ✓".format(good))
+        if counts["manual_match"]:
+            parts.append("{} M manual".format(counts["manual_match"]))
         if counts["low_confidence_match"]:
             parts.append("{} ≈ low-conf".format(counts["low_confidence_match"]))
         if counts["missing_actual"]:
@@ -526,6 +875,7 @@ class ReportDiffWindow(QMainWindow):
             align_slides=self.align_check.isChecked(),
             min_match_score=float(self.matching_spin.value()) / 100.0,
             gap_penalty=float(self.gap_penalty_spin.value()),
+            match_overrides=self.overrides_edit.text().strip() or None,
         )
 
     def run_compare(self) -> None:
@@ -539,6 +889,11 @@ class ReportDiffWindow(QMainWindow):
         self.detail_box.clear()
         self.preview.label.setText("Running compare...")
         self.preview._pixmap = None
+        self.preview._last_image_path = None
+        # Stale pixmaps from a previous run would point at PNGs about to be
+        # overwritten; drop them so the next selection re-reads fresh data.
+        _PIXMAP_CACHE.clear()
+        _THUMB_CACHE.clear()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("0% - Starting")
         self.statusBar().showMessage("Comparing reports. PowerPoint may take a moment...")
@@ -567,9 +922,11 @@ class ReportDiffWindow(QMainWindow):
         self.output_dir = output_dir
         self.run_button.setEnabled(True)
         self.open_output_button.setEnabled(bool(output_dir))
+        self.export_overrides_button.setEnabled(bool(self.pixel_results))
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("100% - Done")
         self.populate_slide_list()
+        self._populate_original_file_lists()
         self._update_summary()
         diff_pages = len([result for result in self.pixel_results if not result.passed])
         self.statusBar().showMessage(
@@ -588,6 +945,9 @@ class ReportDiffWindow(QMainWindow):
         QMessageBox.critical(self, "Compare failed", message.splitlines()[-1] if message else "Unknown error")
 
     def populate_slide_list(self) -> None:
+        # Suppress per-item currentItemChanged churn while we repopulate; we
+        # restore the selection (and let the handler fire) once at the end.
+        self.slide_list.blockSignals(True)
         self.slide_list.clear()
         only_diff = self.only_diff_check.isChecked()
         hide_unmatched = self.hide_unmatched_check.isChecked()
@@ -609,15 +969,24 @@ class ReportDiffWindow(QMainWindow):
                     len(result.regions),
                 )
             )
+            # Thumbnail: overlay if we have one, else whichever side exists.
+            thumb_source = result.output_overlay or result.output_actual or result.output_expected
+            if thumb_source:
+                thumb = _load_thumbnail_cached(thumb_source, self.slide_list.iconSize())
+                if thumb is not None:
+                    item.setIcon(QIcon(thumb))
             if result.match_status == "low_confidence_match":
                 item.setForeground(QBrush(QColor(180, 100, 0)))  # amber — matched but low sim score
+            elif result.match_status == "manual_match":
+                item.setForeground(QBrush(QColor(40, 90, 180)))  # blue — user-asserted pairing
             elif result.match_status in ("extra_actual", "missing_actual"):
                 item.setForeground(QBrush(QColor(140, 140, 140)))  # gray — unmatched
             item.setData(Qt.UserRole, result)
             self.slide_list.addItem(item)
 
+        self.slide_list.blockSignals(False)
         if self.slide_list.count() > 0:
-            self.slide_list.setCurrentRow(0)
+            self.slide_list.setCurrentRow(0)  # fires slide_selected once
         else:
             self.preview.label.setText("No different slides")
             self.preview._pixmap = None
