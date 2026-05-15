@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """GUI for PPT report visual comparison."""
 
 from __future__ import annotations
@@ -47,7 +47,8 @@ HELP = {
     "allowed": "Allowed different-pixel percent before a slide is DIFF. 0 strict; 0.01-0.05 tolerates tiny render noise.",
     "align": "Match slides by visual similarity before diff. Use when report page counts or order differ.",
     "matching": "Minimum similarity percentage for auto matching. 82% is practical; raise if wrong slides match, lower if related slides do not match.",
-    "boxes": "Show or hide red highlight rectangles. Hover a rectangle to see its bbox/size.",
+    "boxes": "Show or hide red highlight rectangles. Very large regions use lighter fill. Hover a visible rectangle to see its bbox/size.",
+    "unmatched": "Hide pairs where one side has no matching slide, such as extra_actual or missing_actual.",
     "output": "Relative output folder inside this downloaded package only.",
 }
 
@@ -137,6 +138,8 @@ class ImagePreview(QScrollArea):
     def _show_region_tooltip(self, event) -> None:
         if self._pixmap is None or self._scaled is None or self._result is None:
             return
+        if not self._show_boxes:
+            return
         if not self._result.regions:
             return
 
@@ -151,7 +154,13 @@ class ImagePreview(QScrollArea):
 
         original_x = int(px * self._pixmap.width() / max(1, scaled_size.width()))
         original_y = int(py * self._pixmap.height() / max(1, scaled_size.height()))
+        indexed_regions = []
         for idx, region in enumerate(self._result.regions, start=1):
+            x1, y1, x2, y2 = region
+            area = max(1, (x2 - x1) * (y2 - y1))
+            indexed_regions.append((area, idx, region))
+
+        for _area, idx, region in sorted(indexed_regions):
             x1, y1, x2, y2 = region
             if x1 <= original_x <= x2 and y1 <= original_y <= y2:
                 width = x2 - x1
@@ -232,18 +241,23 @@ class ReportDiffWindow(QMainWindow):
         self.show_boxes_check = QCheckBox("Show highlight boxes")
         self.show_boxes_check.setChecked(True)
         self.show_boxes_check.setToolTip(HELP["boxes"])
+        self.show_boxes_check.stateChanged.connect(lambda _state: self.update_preview_status())
         self.show_boxes_check.stateChanged.connect(self.refresh_current_preview)
 
         self.view_overlay_button = QPushButton("Overlay")
-        self.view_expected_button = QPushButton("Expected")
-        self.view_actual_button = QPushButton("Actual")
+        self.toggle_original_button = QPushButton("Toggle original")
+        self.original_status_label = QLabel("View: Overlay")
         self.view_overlay_button.setToolTip("Show actual report with red highlight boxes")
-        self.view_expected_button.setToolTip("Show original expected/old slide image")
-        self.view_actual_button.setToolTip("Show original actual/new slide image without highlight boxes")
+        self.toggle_original_button.setToolTip("Switch between original expected/old and actual/new slide images")
         self.view_overlay_button.clicked.connect(lambda: self.set_preview_mode("overlay"))
-        self.view_expected_button.clicked.connect(lambda: self.set_preview_mode("expected"))
-        self.view_actual_button.clicked.connect(lambda: self.set_preview_mode("actual"))
+        self.toggle_original_button.clicked.connect(self.toggle_original_preview)
         self.preview_mode = "overlay"
+        self.original_mode = "expected"
+
+        self.hide_unmatched_check = QCheckBox("Hide unmatched slides")
+        self.hide_unmatched_check.setChecked(True)
+        self.hide_unmatched_check.setToolTip(HELP["unmatched"])
+        self.hide_unmatched_check.stateChanged.connect(self.populate_slide_list)
 
         self.only_diff_check = QCheckBox("Only different slides")
         self.only_diff_check.setChecked(True)
@@ -286,6 +300,7 @@ class ReportDiffWindow(QMainWindow):
         form.addRow("Auto align", self._control_with_help(self.align_check, HELP["align"]))
         form.addRow("Min Matching", self._control_with_help(self.matching_spin, HELP["matching"]))
         form.addRow("Highlight", self._control_with_help(self.show_boxes_check, HELP["boxes"]))
+        form.addRow("Unmatched", self._control_with_help(self.hide_unmatched_check, HELP["unmatched"]))
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -301,8 +316,8 @@ class ReportDiffWindow(QMainWindow):
         preview_toolbar = QHBoxLayout()
         preview_toolbar.addWidget(QLabel("View"))
         preview_toolbar.addWidget(self.view_overlay_button)
-        preview_toolbar.addWidget(self.view_expected_button)
-        preview_toolbar.addWidget(self.view_actual_button)
+        preview_toolbar.addWidget(self.toggle_original_button)
+        preview_toolbar.addWidget(self.original_status_label)
         preview_toolbar.addStretch(1)
         right_layout.addLayout(preview_toolbar)
         right_layout.addWidget(self.preview, 4)
@@ -422,7 +437,10 @@ class ReportDiffWindow(QMainWindow):
     def populate_slide_list(self) -> None:
         self.slide_list.clear()
         only_diff = self.only_diff_check.isChecked()
+        hide_unmatched = self.hide_unmatched_check.isChecked()
         for result in self.pixel_results:
+            if hide_unmatched and result.match_status in ("extra_actual", "missing_actual"):
+                continue
             if only_diff and result.passed:
                 continue
             item = QListWidgetItem(
@@ -447,7 +465,30 @@ class ReportDiffWindow(QMainWindow):
 
     def set_preview_mode(self, mode: str) -> None:
         self.preview_mode = mode
+        self.update_preview_status()
         self.refresh_current_preview()
+
+    def toggle_original_preview(self) -> None:
+        if self.preview_mode not in ("expected", "actual"):
+            self.preview_mode = self.original_mode
+        elif self.preview_mode == "expected":
+            self.preview_mode = "actual"
+            self.original_mode = "actual"
+        else:
+            self.preview_mode = "expected"
+            self.original_mode = "expected"
+        self.update_preview_status()
+        self.refresh_current_preview()
+
+    def update_preview_status(self) -> None:
+        if self.preview_mode == "expected":
+            self.original_status_label.setText("Original: Expected")
+        elif self.preview_mode == "actual":
+            self.original_status_label.setText("Original: Actual")
+        elif self.show_boxes_check.isChecked():
+            self.original_status_label.setText("View: Overlay")
+        else:
+            self.original_status_label.setText("View: Actual clean")
 
     def refresh_current_preview(self) -> None:
         current = self.slide_list.currentItem()
@@ -467,13 +508,22 @@ class ReportDiffWindow(QMainWindow):
         if current is None:
             return
         result = current.data(Qt.UserRole)
-        self.preview.set_result(result, self.show_boxes_check.isChecked())
+        self.preview.set_result(result, self.show_boxes_check.isChecked() and self.preview_mode == "overlay")
         self.preview.set_image(self.image_path_for_mode(result))
+        if result.match_status in ("extra_actual", "missing_actual"):
+            details = [
+                "Pair: {}".format(result.page),
+                "Expected page: {}".format(result.expected_page if result.expected_page is not None else "-"),
+                "Actual page: {}".format(result.actual_page if result.actual_page is not None else "-"),
+                "Match status: {}".format(result.match_status),
+                "Unmatched slide. Detailed diff is hidden; compare only matched slide pairs.",
+            ]
+            self.detail_box.setPlainText("\n".join(details))
+            return
         details = [
             "Pair: {}".format(result.page),
             "Expected page: {}".format(result.expected_page if result.expected_page is not None else "-"),
             "Actual page: {}".format(result.actual_page if result.actual_page is not None else "-"),
-            "Match status: {}".format(result.match_status),
             "Status: {}".format("PASS" if result.passed else "DIFFERENT"),
             "Different pixels: {} / {}".format(result.different_pixels, result.compared_pixels),
             "Difference percent: {:.6f}%".format(result.difference_percent),

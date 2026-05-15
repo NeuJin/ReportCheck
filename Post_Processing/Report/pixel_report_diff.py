@@ -244,13 +244,18 @@ def make_overlay(
     overlay = base.convert("RGBA")
     highlight_layer = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(highlight_layer)
-    fill = (highlight_color[0], highlight_color[1], highlight_color[2], alpha)
     outline = (highlight_color[0], highlight_color[1], highlight_color[2], 255)
+    image_area = max(1, overlay.size[0] * overlay.size[1])
 
     for region in regions:
+        x1, y1, x2, y2 = region
+        region_area = max(1, (x2 - x1) * (y2 - y1))
+        fill_alpha = alpha
+        if region_area / float(image_area) >= 0.08:
+            fill_alpha = max(8, alpha // 5)
+        fill = (highlight_color[0], highlight_color[1], highlight_color[2], fill_alpha)
         draw.rectangle(region, fill=fill, outline=outline)
         for inset in range(1, 4):
-            x1, y1, x2, y2 = region
             if x2 - x1 > inset * 2 and y2 - y1 > inset * 2:
                 draw.rectangle((x1 + inset, y1 + inset, x2 - inset, y2 - inset), outline=outline)
 

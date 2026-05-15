@@ -1,4 +1,4 @@
-﻿# Pixel Report Diff Tool
+# Pixel Report Diff Tool
 
 Compare two reports by rendered pixels and/or PowerPoint objects.
 
@@ -27,7 +27,8 @@ Workflow:
 2. Select the actual PPT/PPTX report.
 3. Keep output as `output` so all generated files stay inside the downloaded package.
 4. Click `Run compare`.
-5. Watch the progress bar for current processing status and percent.\n6. Use the slide list to view only different slides.
+5. Watch the progress bar for current processing status and percent.
+6. Use the slide list to review different matched slides.
 
 The GUI includes inline explanations for Pixel threshold, DPI, and Allowed diff %. It highlights differences with red rectangle regions using 20% transparent fill and a strong red border. This is easier to inspect than per-pixel red noise.
 ## Install
