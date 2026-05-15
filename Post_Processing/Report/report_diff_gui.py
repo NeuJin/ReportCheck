@@ -155,6 +155,17 @@ class ReportDiffWindow(QMainWindow):
         self.allowed_spin.setValue(0.0)
         self.allowed_spin.setToolTip("Allowed different-pixel percent before a slide is DIFF. 0 strict; 0.01-0.05 tolerates tiny render noise.")
 
+        self.align_check = QCheckBox("Auto align slides")
+        self.align_check.setChecked(True)
+        self.align_check.setToolTip("Match slides by visual similarity before diff. Use this when report page counts differ.")
+
+        self.match_score_spin = QDoubleSpinBox()
+        self.match_score_spin.setRange(0.0, 1.0)
+        self.match_score_spin.setDecimals(2)
+        self.match_score_spin.setSingleStep(0.01)
+        self.match_score_spin.setValue(0.82)
+        self.match_score_spin.setToolTip("Minimum similarity score for auto match. Higher is stricter; 0.82 is a practical default.")
+
         self.only_diff_check = QCheckBox("Only different slides")
         self.only_diff_check.setChecked(True)
         self.only_diff_check.stateChanged.connect(self.populate_slide_list)
@@ -198,6 +209,8 @@ class ReportDiffWindow(QMainWindow):
         form.addRow("Pixel threshold", self.threshold_spin)
         form.addRow("DPI", self.dpi_spin)
         form.addRow("Allowed diff %", self.allowed_spin)
+        form.addRow("Auto align", self.align_check)
+        form.addRow("Min match score", self.match_score_spin)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -252,6 +265,8 @@ class ReportDiffWindow(QMainWindow):
             highlight_color=(255, 0, 0),
             alpha=51,
             dpi=self.dpi_spin.value(),
+            align_slides=self.align_check.isChecked(),
+            min_match_score=float(self.match_score_spin.value()),
         )
 
     def run_compare(self) -> None:
@@ -318,9 +333,12 @@ class ReportDiffWindow(QMainWindow):
             if only_diff and result.passed:
                 continue
             item = QListWidgetItem(
-                "Slide {:03d} | {} | {:.6f}% | {} regions".format(
+                "Pair {:03d} | E:{} -> A:{} | {} | score={} | diff {:.6f}% | {} regions".format(
                     result.page,
-                    "PASS" if result.passed else "DIFF",
+                    result.expected_page if result.expected_page is not None else "-",
+                    result.actual_page if result.actual_page is not None else "-",
+                    result.match_status,
+                    result.match_score if result.match_score is not None else "-",
                     result.difference_percent,
                     len(result.regions),
                 )
@@ -341,7 +359,11 @@ class ReportDiffWindow(QMainWindow):
         result = current.data(Qt.UserRole)
         self.preview.set_image(result.output_overlay)
         details = [
-            "Slide: {}".format(result.page),
+            "Pair: {}".format(result.page),
+            "Expected page: {}".format(result.expected_page if result.expected_page is not None else "-"),
+            "Actual page: {}".format(result.actual_page if result.actual_page is not None else "-"),
+            "Match status: {}".format(result.match_status),
+            "Match score: {}".format(result.match_score if result.match_score is not None else "-"),
             "Status: {}".format("PASS" if result.passed else "DIFFERENT"),
             "Different pixels: {} / {}".format(result.different_pixels, result.compared_pixels),
             "Difference percent: {:.6f}%".format(result.difference_percent),
@@ -351,7 +373,7 @@ class ReportDiffWindow(QMainWindow):
             "Overlay: {}".format(result.output_overlay),
             "Mask: {}".format(result.output_mask),
             "",
-            self.object_diff_text(result.page),
+            self.object_diff_text(result.expected_page),
         ]
         self.detail_box.setPlainText("\n".join(details))
 
@@ -387,3 +409,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

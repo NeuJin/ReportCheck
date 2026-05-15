@@ -36,6 +36,10 @@ DEFAULT_OUTPUT_DIR = "output"
 @dataclass
 class PageDiff:
     page: int
+    expected_page: Optional[int]
+    actual_page: Optional[int]
+    match_score: Optional[float]
+    match_status: str
     width: int
     height: int
     compared_pixels: int
@@ -47,6 +51,14 @@ class PageDiff:
     output_overlay: str
     output_mask: str
     regions: List[Tuple[int, int, int, int]]
+
+
+@dataclass
+class SlideMatch:
+    expected_index: Optional[int]
+    actual_index: Optional[int]
+    score: Optional[float]
+    status: str
 
 
 @dataclass
@@ -247,6 +259,10 @@ def compare_page(
     expected: Image.Image,
     actual: Image.Image,
     page_number: int,
+    expected_page: Optional[int],
+    actual_page: Optional[int],
+    match_score: Optional[float],
+    match_status: str,
     output_dir: Path,
     threshold: int,
     allowed_percent: float,
@@ -267,13 +283,20 @@ def compare_page(
     regions = mask_to_regions(mask)
 
     overlay = make_overlay(actual_canvas, regions, highlight_color, alpha)
-    overlay_path = output_dir / "page_{:03d}_overlay.png".format(page_number)
-    mask_path = output_dir / "page_{:03d}_mask.png".format(page_number)
+    expected_label = expected_page if expected_page is not None else 0
+    actual_label = actual_page if actual_page is not None else 0
+    file_stem = "match_{:03d}_expected_{:03d}_actual_{:03d}".format(page_number, expected_label, actual_label)
+    overlay_path = output_dir / "{}_overlay.png".format(file_stem)
+    mask_path = output_dir / "{}_mask.png".format(file_stem)
     overlay.save(overlay_path)
     mask.save(mask_path)
 
     return PageDiff(
         page=page_number,
+        expected_page=expected_page,
+        actual_page=actual_page,
+        match_score=round(match_score, 6) if match_score is not None else None,
+        match_status=match_status,
         width=mask.width,
         height=mask.height,
         compared_pixels=compared_pixels,
@@ -288,6 +311,102 @@ def compare_page(
     )
 
 
+
+def slide_signature(image: Image.Image, size: Tuple[int, int] = (64, 36)) -> Image.Image:
+    return image.convert("L").resize(size)
+
+
+def slide_similarity(expected: Image.Image, actual: Image.Image) -> float:
+    left = slide_signature(expected)
+    right = slide_signature(actual)
+    diff = ImageChops.difference(left, right)
+    histogram = diff.histogram()
+    total = sum(histogram)
+    if total == 0:
+        return 1.0
+    difference_sum = sum(value * count for value, count in enumerate(histogram))
+    mean_difference = difference_sum / float(total)
+    return max(0.0, 1.0 - (mean_difference / 255.0))
+
+
+def align_slide_pages(
+    expected_pages: Sequence[Image.Image],
+    actual_pages: Sequence[Image.Image],
+    min_match_score: float,
+) -> List[SlideMatch]:
+    expected_count = len(expected_pages)
+    actual_count = len(actual_pages)
+    if expected_count == 0 and actual_count == 0:
+        return []
+
+    scores = [
+        [slide_similarity(expected_pages[i], actual_pages[j]) for j in range(actual_count)]
+        for i in range(expected_count)
+    ]
+    gap_penalty = -0.05
+    dp = [[0.0 for _ in range(actual_count + 1)] for _ in range(expected_count + 1)]
+    step = [["" for _ in range(actual_count + 1)] for _ in range(expected_count + 1)]
+
+    for i in range(1, expected_count + 1):
+        dp[i][0] = dp[i - 1][0] + gap_penalty
+        step[i][0] = "missing_actual"
+    for j in range(1, actual_count + 1):
+        dp[0][j] = dp[0][j - 1] + gap_penalty
+        step[0][j] = "extra_actual"
+
+    for i in range(1, expected_count + 1):
+        for j in range(1, actual_count + 1):
+            score = scores[i - 1][j - 1]
+            match_gain = score - min_match_score
+            candidates = (
+                (dp[i - 1][j - 1] + match_gain, "matched"),
+                (dp[i - 1][j] + gap_penalty, "missing_actual"),
+                (dp[i][j - 1] + gap_penalty, "extra_actual"),
+            )
+            best_score, best_step = max(candidates, key=lambda item: item[0])
+            dp[i][j] = best_score
+            step[i][j] = best_step
+
+    matches: List[SlideMatch] = []
+    i = expected_count
+    j = actual_count
+    while i > 0 or j > 0:
+        current = step[i][j]
+        if current == "matched":
+            score = scores[i - 1][j - 1]
+            if score >= min_match_score:
+                matches.append(SlideMatch(i - 1, j - 1, score, "matched"))
+            else:
+                matches.append(SlideMatch(i - 1, None, None, "missing_actual"))
+                matches.append(SlideMatch(None, j - 1, None, "extra_actual"))
+            i -= 1
+            j -= 1
+        elif current == "missing_actual" or j == 0:
+            matches.append(SlideMatch(i - 1, None, None, "missing_actual"))
+            i -= 1
+        else:
+            matches.append(SlideMatch(None, j - 1, None, "extra_actual"))
+            j -= 1
+
+    matches.reverse()
+    return matches
+
+
+def index_slide_pages(expected_pages: Sequence[Image.Image], actual_pages: Sequence[Image.Image]) -> List[SlideMatch]:
+    page_count = max(len(expected_pages), len(actual_pages))
+    matches: List[SlideMatch] = []
+    for index in range(page_count):
+        expected_index = index if index < len(expected_pages) else None
+        actual_index = index if index < len(actual_pages) else None
+        if expected_index is not None and actual_index is not None:
+            matches.append(SlideMatch(expected_index, actual_index, None, "same_index"))
+        elif expected_index is not None:
+            matches.append(SlideMatch(expected_index, None, None, "missing_actual"))
+        else:
+            matches.append(SlideMatch(None, actual_index, None, "extra_actual"))
+    return matches
+
+
 def compare_pixels(args: argparse.Namespace, output_dir: Path) -> List[PageDiff]:
     temp_root = Path(tempfile.mkdtemp(prefix="report_diff_render_"))
     try:
@@ -296,18 +415,28 @@ def compare_pixels(args: argparse.Namespace, output_dir: Path) -> List[PageDiff]
     finally:
         shutil.rmtree(str(temp_root), ignore_errors=True)
 
-    page_count = max(len(expected_pages), len(actual_pages))
+    min_match_score = getattr(args, "min_match_score", 0.82)
+    align_slides = bool(getattr(args, "align_slides", False))
+    if align_slides:
+        matches = align_slide_pages(expected_pages, actual_pages, min_match_score)
+    else:
+        matches = index_slide_pages(expected_pages, actual_pages)
+
     results = []
     blank = Image.new("RGB", (1, 1), (255, 255, 255))
 
-    for index in range(page_count):
-        expected = expected_pages[index] if index < len(expected_pages) else blank
-        actual = actual_pages[index] if index < len(actual_pages) else blank
+    for compare_index, match in enumerate(matches, start=1):
+        expected = expected_pages[match.expected_index] if match.expected_index is not None else blank
+        actual = actual_pages[match.actual_index] if match.actual_index is not None else blank
         results.append(
             compare_page(
                 expected=expected,
                 actual=actual,
-                page_number=index + 1,
+                page_number=compare_index,
+                expected_page=match.expected_index + 1 if match.expected_index is not None else None,
+                actual_page=match.actual_index + 1 if match.actual_index is not None else None,
+                match_score=match.score,
+                match_status=match.status,
                 output_dir=output_dir,
                 threshold=args.threshold,
                 allowed_percent=args.allowed_percent,
@@ -440,6 +569,8 @@ def validate_inputs(args: argparse.Namespace) -> None:
 
     if args.threshold < 0 or args.threshold > 255:
         raise ValueError("--threshold must be between 0 and 255")
+    if getattr(args, "min_match_score", 0.82) < 0 or getattr(args, "min_match_score", 0.82) > 1:
+        raise ValueError("--min-match-score must be between 0 and 1")
     if args.allowed_percent < 0 or args.allowed_percent > 100:
         raise ValueError("--allowed-percent must be between 0 and 100")
     if args.alpha < 0 or args.alpha > 255:
@@ -470,9 +601,13 @@ def print_summary(pixel_results: Iterable[PageDiff], object_diffs: Sequence[Obje
 
         status = "PASS" if result.passed else "FAIL"
         print(
-            "[{}] page={} diff={:.6f}% pixels={}/{} bbox={} overlay={}".format(
+            "[{}] pair={} expected={} actual={} match={} score={} diff={:.6f}% pixels={}/{} bbox={} overlay={}".format(
                 status,
                 result.page,
+                result.expected_page,
+                result.actual_page,
+                result.match_status,
+                result.match_score,
                 result.difference_percent,
                 result.different_pixels,
                 result.compared_pixels,
@@ -517,6 +652,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("pixel", "object", "both"),
         default="pixel",
         help="pixel renders pages/slides; object compares PPTX shapes; both runs both checks",
+    )
+    parser.add_argument(
+        "--align-slides",
+        action="store_true",
+        help="Auto-match slides by visual similarity before comparing",
+    )
+    parser.add_argument(
+        "--min-match-score",
+        type=float,
+        default=0.82,
+        help="Minimum visual similarity score for auto slide matching, 0.0 to 1.0",
     )
     parser.add_argument(
         "-t",
@@ -582,6 +728,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

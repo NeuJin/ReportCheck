@@ -45,6 +45,29 @@ Dependencies by input type, matched to your current environment:
 - PPTX object comparison: `python-pptx 0.6.18`
 - GUI window: `PySide2 5.15.2`
 
+
+## Auto Slide Alignment
+
+Use this when two reports have inserted, removed, or shifted slides:
+
+```powershell
+python pixel_report_diff.py expected.pptx actual.pptx --mode pixel --align-slides --min-match-score 0.82
+```
+
+The output maps each comparison pair:
+
+```text
+Expected page | Actual page | Match score | Status
+```
+
+Statuses:
+
+- `matched`: visually similar slides are compared and overlaid.
+- `extra_actual`: slide exists only in the actual report.
+- `missing_actual`: slide exists only in the expected report.
+- `same_index`: used when auto-align is off.
+
+The GUI has `Auto align slides` enabled by default. Lower `Min match score` if related slides are not matching; raise it if unrelated slides are matched.
 ## Usage
 
 ```powershell
@@ -100,6 +123,7 @@ Pixel comparison catches the final visual result, including charts, images, font
 Object comparison catches changes in PPTX shape order, position, size, text, and embedded image content without relying on screenshot rendering. It is useful for precise automation, but it may not fully understand complex charts, SmartArt, grouped objects, or effects.
 
 Use `--mode both` when the report quality gate matters: pixel diff verifies the visual output, and object diff explains many structural changes.
+
 
 
 
