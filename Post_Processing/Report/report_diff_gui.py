@@ -10,6 +10,7 @@ import sys
 import tempfile
 import traceback
 from collections import OrderedDict
+from dataclasses import asdict, fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional
@@ -407,11 +408,9 @@ class ReportDiffWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Ready")
 
-        # Slide-navigator: three tabs sharing a panel.
-        #   Pairs    — comparison pairs (with status icons + manual overrides)
-        #   Expected — every slide in the expected file, like PowerPoint's strip
-        #   Actual   — every slide in the actual file
-        # Tracked in memory between runs so the user can flip back-and-forth.
+        # Pairs list (centre-left): comparison pairs with status icons + thumbnails.
+        # Expected / Actual lists (right panel): full per-file slide strips, shown
+        # side-by-side so the user can pick one from each and pair them visually.
         thumb_icon_size = QSize(120, 68)
 
         self.slide_list = QListWidget()
@@ -431,10 +430,28 @@ class ReportDiffWindow(QMainWindow):
         self.actual_list.setSpacing(2)
         self.actual_list.currentItemChanged.connect(self._actual_selected)
 
-        self.slide_tabs = QTabWidget()
-        self.slide_tabs.addTab(self.slide_list, "Pairs")
-        self.slide_tabs.addTab(self.expected_list, "Expected slides")
-        self.slide_tabs.addTab(self.actual_list, "Actual slides")
+        # "Pair selected" button used between the two side-by-side lists.
+        self.pair_selected_button = QPushButton("🔗  Pair selected")
+        self.pair_selected_button.setToolTip(
+            "Select one slide on the Expected side and one on the Actual side, "
+            "then click this to create a manual pair. The new pair appears in "
+            "the Pairs list immediately — no re-Run needed."
+        )
+        self.pair_selected_button.clicked.connect(self._pair_selected_slides)
+
+        # Session save/load — lets the user resume a comparison later without
+        # re-running anything.
+        self.save_session_button = QPushButton("Save session…")
+        self.save_session_button.setToolTip(
+            "Save settings + manual overrides + current results to a JSON file "
+            "you can open later without re-running compare."
+        )
+        self.save_session_button.clicked.connect(self.save_session)
+        self.load_session_button = QPushButton("Load session…")
+        self.load_session_button.setToolTip(
+            "Restore a saved session (settings, overrides, and last results)."
+        )
+        self.load_session_button.clicked.connect(self.load_session)
 
         # In-memory manual overrides: 0-based expected idx → 0-based actual idx
         # (or None for forced-missing). Persisted across runs within the session.
@@ -516,10 +533,53 @@ class ReportDiffWindow(QMainWindow):
         left_layout.addLayout(action_row)
         left_layout.addWidget(self.progress_bar)
         left_layout.addWidget(self.summary_label)
-        left_layout.addWidget(self.slide_tabs, 1)
+        left_layout.addWidget(QLabel("Comparison pairs (right-click for manual override)"))
+        left_layout.addWidget(self.slide_list, 1)
+
+        # Session toolbar — pinned at the very top of the left panel.
+        session_row = QHBoxLayout()
+        session_row.addWidget(self.save_session_button)
+        session_row.addWidget(self.load_session_button)
+        session_row.addStretch(1)
+        left_layout.insertLayout(0, session_row)
+
+        # ── Right panel ──────────────────────────────────────────────────────
+        # Top: Expected | [Pair] | Actual lists side by side.
+        # Below: preview toolbar, preview, details.
+
+        expected_box = QWidget()
+        ev = QVBoxLayout(expected_box)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(2)
+        ev.addWidget(QLabel("Expected slides"))
+        ev.addWidget(self.expected_list, 1)
+
+        actual_box = QWidget()
+        av = QVBoxLayout(actual_box)
+        av.setContentsMargins(0, 0, 0, 0)
+        av.setSpacing(2)
+        av.addWidget(QLabel("Actual slides"))
+        av.addWidget(self.actual_list, 1)
+
+        pair_button_box = QWidget()
+        pb = QVBoxLayout(pair_button_box)
+        pb.setContentsMargins(4, 4, 4, 4)
+        pb.addStretch(1)
+        pb.addWidget(self.pair_selected_button)
+        pb.addStretch(1)
+
+        lists_splitter = QSplitter(Qt.Horizontal)
+        lists_splitter.addWidget(expected_box)
+        lists_splitter.addWidget(pair_button_box)
+        lists_splitter.addWidget(actual_box)
+        lists_splitter.setStretchFactor(0, 1)
+        lists_splitter.setStretchFactor(1, 0)
+        lists_splitter.setStretchFactor(2, 1)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
+        right_layout.addWidget(lists_splitter, 3)
+
         preview_toolbar = QHBoxLayout()
         preview_toolbar.addWidget(QLabel("View"))
         preview_toolbar.addWidget(self.view_overlay_button)
@@ -715,6 +775,282 @@ class ReportDiffWindow(QMainWindow):
         self.manual_overrides.clear()
         self.overrides_edit.clear()
         self.statusBar().showMessage("All manual overrides cleared.", 4000)
+
+    # ── Visual pair-by-click between Expected / Actual lists ──────────────
+
+    def _pair_selected_slides(self) -> None:
+        """Create a manual pair from the currently-selected Expected + Actual slides.
+
+        The new pair is materialised *immediately* via engine.compare_page using
+        the per-slide PNGs already in the output folder — so the user sees the
+        diff right away without a full re-Run. The pairing is also recorded in
+        self.manual_overrides so the next Run keeps it.
+        """
+        e_item = self.expected_list.currentItem()
+        a_item = self.actual_list.currentItem()
+        if e_item is None or a_item is None:
+            QMessageBox.information(
+                self,
+                "Select slides",
+                "Highlight one slide on the Expected side and one on the Actual "
+                "side, then click Pair.",
+            )
+            return
+        if not self.output_dir:
+            QMessageBox.warning(
+                self,
+                "No output folder",
+                "Run a comparison once first so the tool has somewhere to write the diff images.",
+            )
+            return
+
+        e_slide, e_path = e_item.data(Qt.UserRole)
+        a_slide, a_path = a_item.data(Qt.UserRole)
+
+        for result in self.pixel_results:
+            if result.expected_page == e_slide and result.actual_page == a_slide:
+                self.statusBar().showMessage(
+                    "Expected slide {} is already paired with actual slide {}.".format(
+                        e_slide, a_slide
+                    ),
+                    4000,
+                )
+                return
+
+        # Drop any conflicting pair, remembering the slides that lost their partner
+        # so we can re-add them as missing/extra entries.
+        orphan_actual: "list[tuple]" = []
+        orphan_expected: "list[tuple]" = []
+        kept = []
+        for result in self.pixel_results:
+            if result.expected_page == e_slide:
+                if result.actual_page is not None and result.actual_page != a_slide:
+                    orphan_actual.append((result.actual_page, result.output_actual))
+                continue
+            if result.actual_page == a_slide:
+                if result.expected_page is not None and result.expected_page != e_slide:
+                    orphan_expected.append((result.expected_page, result.output_expected))
+                continue
+            kept.append(result)
+
+        try:
+            new_pair = self._build_manual_pair(e_slide, e_path, a_slide, a_path,
+                                                len(kept) + 1)
+            new_results = kept + [new_pair]
+            next_no = len(new_results) + 1
+            for slide_no, image_path in orphan_expected:
+                new_results.append(self._build_unmatched_pair(
+                    slide_no, image_path, side="expected", pair_number=next_no))
+                next_no += 1
+            for slide_no, image_path in orphan_actual:
+                new_results.append(self._build_unmatched_pair(
+                    slide_no, image_path, side="actual", pair_number=next_no))
+                next_no += 1
+        except Exception as exc:
+            QMessageBox.critical(self, "Pair generation failed", str(exc))
+            return
+
+        self.pixel_results = new_results
+        self._renumber_pairs()
+        self.manual_overrides[e_slide - 1] = a_slide - 1
+
+        self.populate_slide_list()
+        self._update_summary()
+        self._mark_overrides_pending()
+        self.statusBar().showMessage(
+            "Paired expected slide {} ↔ actual slide {}.".format(e_slide, a_slide),
+            5000,
+        )
+
+    def _build_manual_pair(
+        self,
+        expected_slide: int,
+        expected_path: str,
+        actual_slide: int,
+        actual_path: str,
+        pair_number: int,
+    ):
+        from PIL import Image
+        expected_img = Image.open(expected_path).convert("RGB")
+        actual_img = Image.open(actual_path).convert("RGB")
+        return engine.compare_page(
+            expected=expected_img,
+            actual=actual_img,
+            page_number=pair_number,
+            expected_page=expected_slide,
+            actual_page=actual_slide,
+            match_score=1.0,
+            match_status="manual_match",
+            output_dir=Path(self.output_dir),
+            threshold=self.threshold_spin.value(),
+            allowed_percent=float(self.allowed_spin.value()),
+            highlight_color=(255, 0, 0),
+            alpha=51,
+        )
+
+    def _build_unmatched_pair(
+        self,
+        slide_number: int,
+        image_path: str,
+        side: str,  # 'expected' or 'actual'
+        pair_number: int,
+    ):
+        from PIL import Image
+        blank = Image.new("RGB", (1, 1), (255, 255, 255))
+        try:
+            slide_img = Image.open(image_path).convert("RGB")
+        except Exception:
+            slide_img = blank
+        if side == "expected":
+            expected_img, actual_img = slide_img, blank
+            e_page, a_page, status = slide_number, None, "missing_actual"
+        else:
+            expected_img, actual_img = blank, slide_img
+            e_page, a_page, status = None, slide_number, "extra_actual"
+        return engine.compare_page(
+            expected=expected_img,
+            actual=actual_img,
+            page_number=pair_number,
+            expected_page=e_page,
+            actual_page=a_page,
+            match_score=None,
+            match_status=status,
+            output_dir=Path(self.output_dir),
+            threshold=self.threshold_spin.value(),
+            allowed_percent=float(self.allowed_spin.value()),
+            highlight_color=(255, 0, 0),
+            alpha=51,
+        )
+
+    def _renumber_pairs(self) -> None:
+        """Re-sort + re-number pairs so the list reads naturally after edits."""
+        def sort_key(result):
+            e = result.expected_page if result.expected_page is not None else 10 ** 9
+            a = result.actual_page if result.actual_page is not None else 10 ** 9
+            return (e, a)
+        self.pixel_results.sort(key=sort_key)
+        for index, result in enumerate(self.pixel_results, start=1):
+            result.page = index
+
+    # ── Session save / load ───────────────────────────────────────────────
+
+    def save_session(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save session", "session.json", "JSON files (*.json);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            session = {
+                "version": 1,
+                "expected_path": self.expected_edit.text(),
+                "actual_path": self.actual_edit.text(),
+                "output_dir": self.output_dir,
+                "settings": {
+                    "output_dir_field": self.output_edit.text(),
+                    "mode": self.mode_combo.currentText(),
+                    "threshold": self.threshold_spin.value(),
+                    "dpi": self.dpi_spin.value(),
+                    "allowed_percent": self.allowed_spin.value(),
+                    "align_slides": self.align_check.isChecked(),
+                    "min_match_score": self.matching_spin.value(),
+                    "gap_penalty": self.gap_penalty_spin.value(),
+                    "overrides_path": self.overrides_edit.text(),
+                    "show_boxes": self.show_boxes_check.isChecked(),
+                    "hide_unmatched": self.hide_unmatched_check.isChecked(),
+                    "only_diff": self.only_diff_check.isChecked(),
+                },
+                "manual_overrides": {
+                    str(key + 1): (None if value is None else value + 1)
+                    for key, value in self.manual_overrides.items()
+                },
+                "results": {
+                    "pixel_results": [asdict(result) for result in self.pixel_results],
+                    "object_diffs": [asdict(diff) for diff in self.object_diffs],
+                },
+            }
+            Path(path).write_text(
+                json.dumps(session, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.statusBar().showMessage("Session saved: {}".format(path), 6000)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save session failed", str(exc))
+
+    def load_session(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load session", "", "JSON files (*.json);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.expected_edit.setText(data.get("expected_path", ""))
+            self.actual_edit.setText(data.get("actual_path", ""))
+            self.output_dir = data.get("output_dir", "")
+
+            settings_data = data.get("settings", {})
+            if "output_dir_field" in settings_data:
+                self.output_edit.setText(settings_data["output_dir_field"])
+            if "mode" in settings_data:
+                idx = self.mode_combo.findText(settings_data["mode"])
+                if idx >= 0:
+                    self.mode_combo.setCurrentIndex(idx)
+            for key, widget in (
+                ("threshold", self.threshold_spin),
+                ("dpi", self.dpi_spin),
+            ):
+                if key in settings_data:
+                    widget.setValue(int(settings_data[key]))
+            for key, widget in (
+                ("allowed_percent", self.allowed_spin),
+                ("min_match_score", self.matching_spin),
+                ("gap_penalty", self.gap_penalty_spin),
+            ):
+                if key in settings_data:
+                    widget.setValue(float(settings_data[key]))
+            for key, widget in (
+                ("align_slides", self.align_check),
+                ("show_boxes", self.show_boxes_check),
+                ("hide_unmatched", self.hide_unmatched_check),
+                ("only_diff", self.only_diff_check),
+            ):
+                if key in settings_data:
+                    widget.setChecked(bool(settings_data[key]))
+            if "overrides_path" in settings_data:
+                self.overrides_edit.setText(settings_data["overrides_path"])
+
+            self.manual_overrides = {
+                int(key) - 1: (None if value is None else int(value) - 1)
+                for key, value in data.get("manual_overrides", {}).items()
+            }
+
+            results_data = data.get("results", {})
+            page_diff_fields = {f.name for f in fields(engine.PageDiff)}
+            object_diff_fields = {f.name for f in fields(engine.ObjectDiff)}
+
+            self.pixel_results = []
+            for record in results_data.get("pixel_results", []):
+                kwargs = {k: v for k, v in record.items() if k in page_diff_fields}
+                if kwargs.get("bbox") is not None:
+                    kwargs["bbox"] = tuple(kwargs["bbox"])
+                if "regions" in kwargs:
+                    kwargs["regions"] = [tuple(reg) for reg in kwargs["regions"]]
+                self.pixel_results.append(engine.PageDiff(**kwargs))
+
+            self.object_diffs = []
+            for record in results_data.get("object_diffs", []):
+                kwargs = {k: v for k, v in record.items() if k in object_diff_fields}
+                self.object_diffs.append(engine.ObjectDiff(**kwargs))
+
+            self.populate_slide_list()
+            self._populate_original_file_lists()
+            self._update_summary()
+            self.open_output_button.setEnabled(bool(self.output_dir))
+            self.export_overrides_button.setEnabled(bool(self.pixel_results))
+            self.statusBar().showMessage("Session loaded: {}".format(path), 6000)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load session failed", str(exc))
 
     def _mark_overrides_pending(self) -> None:
         """Persist current in-memory overrides to a temp JSON and surface a hint.
