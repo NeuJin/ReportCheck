@@ -67,7 +67,7 @@ Statuses:
 - `missing_actual`: slide exists only in the expected report.
 - `same_index`: used when auto-align is off.
 
-The GUI has `Auto align slides` enabled by default. Lower `Min match score` if related slides are not matching; raise it if unrelated slides are matched.
+The GUI has `Auto align slides` enabled by default. Lower `Min Matching` if related slides are not matching; raise it if unrelated slides are matched.
 ## Usage
 
 ```powershell
@@ -129,3 +129,10 @@ Use `--mode both` when the report quality gate matters: pixel diff verifies the 
 
 
 
+
+## GUI Notes
+
+- `Min Matching` is shown as percent in the GUI. `82%` equals CLI `--min-match-score 0.82`.
+- Parameter explanations are available from the small `?` icons beside each setting.
+- `Show highlight boxes` toggles red rectangles on/off while keeping the same selected slide.
+- Hover a highlight region to see its bbox, region size, expected page, actual page, and diff percent.

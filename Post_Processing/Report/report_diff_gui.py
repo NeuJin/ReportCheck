@@ -8,7 +8,7 @@ import traceback
 from types import SimpleNamespace
 from typing import Optional
 
-from PySide2.QtCore import QObject, QSize, Qt, QThread, Signal
+from PySide2.QtCore import QObject, QSize, Qt, QThread, Signal, QEvent
 from PySide2.QtGui import QPixmap
 from PySide2.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from PySide2.QtWidgets import (
     QSplitter,
     QStatusBar,
     QTextEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -39,16 +40,16 @@ from PySide2.QtWidgets import (
 import pixel_report_diff as engine
 
 
-HELP_TEXT = (
-    "Pixel threshold: ignores tiny RGB differences. 3 is recommended; "
-    "5-8 reduces render noise; 0 is strict.\n"
-    "DPI: screenshot resolution for each slide. 150 is balanced; "
-    "200 catches smaller text/chart changes but runs slower.\n"
-    "Allowed diff %: percent of different pixels allowed before a slide is marked DIFF. "
-    "0 is strict; 0.01-0.05 tolerates small render noise.\n"
-    "Highlight: red rectangles with 20% transparent fill and a strong red border. "
-    "Output always stays inside this package."
-)
+HELP = {
+    "mode": "both = visual pixel diff + PPTX object diff. Recommended.",
+    "threshold": "Ignores tiny per-channel RGB differences. 3 recommended; 5-8 for render noise; 0 strict.",
+    "dpi": "Slide screenshot resolution. 150 balanced; 200 better for small text/charts but slower.",
+    "allowed": "Allowed different-pixel percent before a slide is DIFF. 0 strict; 0.01-0.05 tolerates tiny render noise.",
+    "align": "Match slides by visual similarity before diff. Use when report page counts or order differ.",
+    "matching": "Minimum similarity percentage for auto matching. 82% is practical; raise if wrong slides match, lower if related slides do not match.",
+    "boxes": "Show or hide red highlight rectangles. Hover a rectangle to see its bbox/size.",
+    "output": "Relative output folder inside this downloaded package only.",
+}
 
 
 class CompareWorker(QObject):
@@ -93,14 +94,27 @@ class ImagePreview(QScrollArea):
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setMinimumSize(QSize(640, 360))
         self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.label.setMouseTracking(True)
+        self.label.installEventFilter(self)
+        self.setMouseTracking(True)
         self.setWidget(self.label)
         self.setWidgetResizable(True)
         self._pixmap: Optional[QPixmap] = None
+        self._scaled: Optional[QPixmap] = None
+        self._result = None
+        self._show_boxes = True
+
+    def set_result(self, result, show_boxes: bool) -> None:
+        self._result = result
+        self._show_boxes = show_boxes
+        image_path = result.output_overlay if show_boxes else result.output_actual
+        self.set_image(image_path)
 
     def set_image(self, image_path: str) -> None:
         pixmap = QPixmap(image_path)
         if pixmap.isNull():
             self._pixmap = None
+            self._scaled = None
             self.label.setText("Cannot load image")
             return
         self._pixmap = pixmap
@@ -110,12 +124,61 @@ class ImagePreview(QScrollArea):
         super().resizeEvent(event)
         self._fit_pixmap()
 
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        if obj is self.label and event.type() == QEvent.MouseMove:
+            self._show_region_tooltip(event)
+        return super().eventFilter(obj, event)
+
     def _fit_pixmap(self) -> None:
         if self._pixmap is None:
             return
         size = self.viewport().size()
-        scaled = self._pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.label.setPixmap(scaled)
+        self._scaled = self._pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.label.setPixmap(self._scaled)
+
+    def _show_region_tooltip(self, event) -> None:
+        if self._pixmap is None or self._scaled is None or self._result is None:
+            return
+        if not self._result.regions:
+            return
+
+        label_size = self.label.size()
+        scaled_size = self._scaled.size()
+        offset_x = max(0, (label_size.width() - scaled_size.width()) // 2)
+        offset_y = max(0, (label_size.height() - scaled_size.height()) // 2)
+        px = event.pos().x() - offset_x
+        py = event.pos().y() - offset_y
+        if px < 0 or py < 0 or px >= scaled_size.width() or py >= scaled_size.height():
+            return
+
+        original_x = int(px * self._pixmap.width() / max(1, scaled_size.width()))
+        original_y = int(py * self._pixmap.height() / max(1, scaled_size.height()))
+        for idx, region in enumerate(self._result.regions, start=1):
+            x1, y1, x2, y2 = region
+            if x1 <= original_x <= x2 and y1 <= original_y <= y2:
+                width = x2 - x1
+                height = y2 - y1
+                text = (
+                    "Highlight region #{idx}\n"
+                    "bbox: ({x1}, {y1}) - ({x2}, {y2})\n"
+                    "size: {width} x {height}px\n"
+                    "Expected page: {expected}\n"
+                    "Actual page: {actual}\n"
+                    "Diff: {diff:.6f}%"
+                ).format(
+                    idx=idx,
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    width=width,
+                    height=height,
+                    expected=self._result.expected_page if self._result.expected_page is not None else "-",
+                    actual=self._result.actual_page if self._result.actual_page is not None else "-",
+                    diff=self._result.difference_percent,
+                )
+                QToolTip.showText(event.globalPos(), text, self.label)
+                return
 
 
 class ReportDiffWindow(QMainWindow):
@@ -132,39 +195,46 @@ class ReportDiffWindow(QMainWindow):
         self.expected_edit = QLineEdit()
         self.actual_edit = QLineEdit()
         self.output_edit = QLineEdit(engine.DEFAULT_OUTPUT_DIR)
-        self.output_edit.setToolTip("Relative folder inside this downloaded package only")
+        self.output_edit.setToolTip(HELP["output"])
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["both", "pixel", "object"])
-        self.mode_combo.setToolTip("both = visual pixel diff + PPTX object diff. Recommended.")
+        self.mode_combo.setToolTip(HELP["mode"])
 
         self.threshold_spin = QSpinBox()
         self.threshold_spin.setRange(0, 255)
         self.threshold_spin.setValue(3)
-        self.threshold_spin.setToolTip("Ignore tiny per-channel color differences. 3 recommended; 5-8 for render noise; 0 strict.")
+        self.threshold_spin.setToolTip(HELP["threshold"])
 
         self.dpi_spin = QSpinBox()
         self.dpi_spin.setRange(50, 300)
         self.dpi_spin.setValue(150)
-        self.dpi_spin.setToolTip("Slide screenshot resolution. 150 balanced; 200 better for small text/charts but slower.")
+        self.dpi_spin.setToolTip(HELP["dpi"])
 
         self.allowed_spin = QDoubleSpinBox()
         self.allowed_spin.setRange(0.0, 100.0)
         self.allowed_spin.setDecimals(4)
         self.allowed_spin.setSingleStep(0.01)
         self.allowed_spin.setValue(0.0)
-        self.allowed_spin.setToolTip("Allowed different-pixel percent before a slide is DIFF. 0 strict; 0.01-0.05 tolerates tiny render noise.")
+        self.allowed_spin.setSuffix(" %")
+        self.allowed_spin.setToolTip(HELP["allowed"])
 
         self.align_check = QCheckBox("Auto align slides")
         self.align_check.setChecked(True)
-        self.align_check.setToolTip("Match slides by visual similarity before diff. Use this when report page counts differ.")
+        self.align_check.setToolTip(HELP["align"])
 
-        self.match_score_spin = QDoubleSpinBox()
-        self.match_score_spin.setRange(0.0, 1.0)
-        self.match_score_spin.setDecimals(2)
-        self.match_score_spin.setSingleStep(0.01)
-        self.match_score_spin.setValue(0.82)
-        self.match_score_spin.setToolTip("Minimum similarity score for auto match. Higher is stricter; 0.82 is a practical default.")
+        self.matching_spin = QDoubleSpinBox()
+        self.matching_spin.setRange(0.0, 100.0)
+        self.matching_spin.setDecimals(1)
+        self.matching_spin.setSingleStep(1.0)
+        self.matching_spin.setValue(82.0)
+        self.matching_spin.setSuffix(" %")
+        self.matching_spin.setToolTip(HELP["matching"])
+
+        self.show_boxes_check = QCheckBox("Show highlight boxes")
+        self.show_boxes_check.setChecked(True)
+        self.show_boxes_check.setToolTip(HELP["boxes"])
+        self.show_boxes_check.stateChanged.connect(self.refresh_current_preview)
 
         self.only_diff_check = QCheckBox("Only different slides")
         self.only_diff_check.setChecked(True)
@@ -177,11 +247,6 @@ class ReportDiffWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Ready")
-
-        self.help_box = QTextEdit()
-        self.help_box.setReadOnly(True)
-        self.help_box.setMaximumHeight(150)
-        self.help_box.setPlainText(HELP_TEXT)
 
         self.slide_list = QListWidget()
         self.slide_list.currentItemChanged.connect(self.slide_selected)
@@ -204,13 +269,14 @@ class ReportDiffWindow(QMainWindow):
         form = QFormLayout()
         form.addRow("Expected report", self._path_row(self.expected_edit, expected_button))
         form.addRow("Actual report", self._path_row(self.actual_edit, actual_button))
-        form.addRow("Output folder", self.output_edit)
-        form.addRow("Mode", self.mode_combo)
-        form.addRow("Pixel threshold", self.threshold_spin)
-        form.addRow("DPI", self.dpi_spin)
-        form.addRow("Allowed diff %", self.allowed_spin)
-        form.addRow("Auto align", self.align_check)
-        form.addRow("Min match score", self.match_score_spin)
+        form.addRow("Output folder", self._control_with_help(self.output_edit, HELP["output"]))
+        form.addRow("Mode", self._control_with_help(self.mode_combo, HELP["mode"]))
+        form.addRow("Pixel threshold", self._control_with_help(self.threshold_spin, HELP["threshold"]))
+        form.addRow("DPI", self._control_with_help(self.dpi_spin, HELP["dpi"]))
+        form.addRow("Allowed diff", self._control_with_help(self.allowed_spin, HELP["allowed"]))
+        form.addRow("Auto align", self._control_with_help(self.align_check, HELP["align"]))
+        form.addRow("Min Matching", self._control_with_help(self.matching_spin, HELP["matching"]))
+        form.addRow("Highlight", self._control_with_help(self.show_boxes_check, HELP["boxes"]))
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -218,8 +284,6 @@ class ReportDiffWindow(QMainWindow):
         left_layout.addWidget(self.only_diff_check)
         left_layout.addWidget(self.run_button)
         left_layout.addWidget(self.progress_bar)
-        left_layout.addWidget(QLabel("Parameter guide"))
-        left_layout.addWidget(self.help_box)
         left_layout.addWidget(QLabel("Slides"))
         left_layout.addWidget(self.slide_list, 1)
 
@@ -244,6 +308,19 @@ class ReportDiffWindow(QMainWindow):
         layout.addWidget(button)
         return row
 
+    def _control_with_help(self, control: QWidget, help_text: str) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(control, 1)
+        help_label = QLabel("?")
+        help_label.setAlignment(Qt.AlignCenter)
+        help_label.setFixedSize(18, 18)
+        help_label.setToolTip(help_text)
+        help_label.setStyleSheet("border: 1px solid #888; border-radius: 9px; color: #333; background: #f2f2f2;")
+        layout.addWidget(help_label)
+        return row
+
     def pick_file(self, edit: QLineEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -266,7 +343,7 @@ class ReportDiffWindow(QMainWindow):
             alpha=51,
             dpi=self.dpi_spin.value(),
             align_slides=self.align_check.isChecked(),
-            min_match_score=float(self.match_score_spin.value()),
+            min_match_score=float(self.matching_spin.value()) / 100.0,
         )
 
     def run_compare(self) -> None:
@@ -333,12 +410,11 @@ class ReportDiffWindow(QMainWindow):
             if only_diff and result.passed:
                 continue
             item = QListWidgetItem(
-                "Pair {:03d} | E:{} -> A:{} | {} | score={} | diff {:.6f}% | {} regions".format(
+                "Pair {:03d} | E:{} -> A:{} | {} | diff {:.6f}% | {} regions".format(
                     result.page,
                     result.expected_page if result.expected_page is not None else "-",
                     result.actual_page if result.actual_page is not None else "-",
                     result.match_status,
-                    result.match_score if result.match_score is not None else "-",
                     result.difference_percent,
                     len(result.regions),
                 )
@@ -353,17 +429,21 @@ class ReportDiffWindow(QMainWindow):
             self.preview._pixmap = None
             self.detail_box.setPlainText(self.object_diff_text())
 
+    def refresh_current_preview(self) -> None:
+        current = self.slide_list.currentItem()
+        if current is not None:
+            self.slide_selected(current, None)
+
     def slide_selected(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]) -> None:
         if current is None:
             return
         result = current.data(Qt.UserRole)
-        self.preview.set_image(result.output_overlay)
+        self.preview.set_result(result, self.show_boxes_check.isChecked())
         details = [
             "Pair: {}".format(result.page),
             "Expected page: {}".format(result.expected_page if result.expected_page is not None else "-"),
             "Actual page: {}".format(result.actual_page if result.actual_page is not None else "-"),
             "Match status: {}".format(result.match_status),
-            "Match score: {}".format(result.match_score if result.match_score is not None else "-"),
             "Status: {}".format("PASS" if result.passed else "DIFFERENT"),
             "Different pixels: {} / {}".format(result.different_pixels, result.compared_pixels),
             "Difference percent: {:.6f}%".format(result.difference_percent),
@@ -371,6 +451,7 @@ class ReportDiffWindow(QMainWindow):
             "Bounding box: {}".format(result.bbox),
             "Highlight regions: {}".format(len(result.regions)),
             "Overlay: {}".format(result.output_overlay),
+            "Actual clean: {}".format(result.output_actual),
             "Mask: {}".format(result.output_mask),
             "",
             self.object_diff_text(result.expected_page),
@@ -409,4 +490,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

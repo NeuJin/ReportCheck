@@ -50,6 +50,8 @@ class PageDiff:
     passed: bool
     output_overlay: str
     output_mask: str
+    output_expected: str
+    output_actual: str
     regions: List[Tuple[int, int, int, int]]
 
 
@@ -288,8 +290,12 @@ def compare_page(
     file_stem = "match_{:03d}_expected_{:03d}_actual_{:03d}".format(page_number, expected_label, actual_label)
     overlay_path = output_dir / "{}_overlay.png".format(file_stem)
     mask_path = output_dir / "{}_mask.png".format(file_stem)
+    expected_path = output_dir / "{}_expected.png".format(file_stem)
+    actual_path = output_dir / "{}_actual.png".format(file_stem)
     overlay.save(overlay_path)
     mask.save(mask_path)
+    expected_canvas.save(expected_path)
+    actual_canvas.save(actual_path)
 
     return PageDiff(
         page=page_number,
@@ -307,6 +313,8 @@ def compare_page(
         passed=passed,
         output_overlay=str(overlay_path),
         output_mask=str(mask_path),
+        output_expected=str(expected_path),
+        output_actual=str(actual_path),
         regions=regions,
     )
 
